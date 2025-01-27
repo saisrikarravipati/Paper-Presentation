@@ -1,0 +1,189 @@
+
+
+Below is a high-level guide (with an example rewritten policy) on how you can reorganize your policy to improve performance and clarity. The general approach:
+
+Use Sets Instead of Arrays
+Repeated membership checks on arrays can be expensive (O(n) each time). In Rego, defining sets and using set-difference or membership tests on sets can reduce complexity.
+
+Pre-Compute Intermediate Results
+If you find yourself iterating over the same data multiple times, define partial sets or objects that “cache” the result. Let the Rego engine handle unification more efficiently.
+
+Consolidate Duplicate Logic
+If you have similar checks in multiple places, factor them into a single rule. For example, if you have repeated logic to see if a test case has a valid status, isolate that to one rule.
+
+Prefer Rule-Based or Partial Set Definitions
+Store things like “missing IDs,” “valid traceability data,” or “unique test cases” as partial sets. You can then reference these sets directly in final result rules.
+
+Leverage Aggregations
+Instead of building arrays or manually counting in multiple places, you can define sets or use Rego’s built-ins like count(...).
+
+Below is a simplified illustrative refactoring. It may not be a 1:1 replacement for your code but demonstrates how to restructure for performance and clarity.
+
+
+
+--------------------------------------------
+
+
+
+package policy.enforcement.TMM.automated_test_validation
+
+# -----------------------------------------------------------------
+# 1) Define sets for valid & missing data instead of repeated loops
+# -----------------------------------------------------------------
+
+# Example import for valid statuses
+# Suppose data.valid.automated.test.case.status is a set or array of valid statuses
+import data.valid.automated.test.case.status as valid_status_list
+
+# Convert it to a set if it's an array
+valid_statuses := { s | s := valid_status_list[_] }
+
+# Set of all JIRA IDs we expect
+jira_ids := { j | j := input.jira_data[_] }
+
+# Set of traceability items that reference valid JIRA IDs
+valid_traceability_data[item] {
+  item := input.traceability_data[_]
+  item.jira_id in jira_ids
+}
+
+# Collect all test cases from valid traceability items
+unique_iica_test_cases := {
+  test_case |
+  some item in valid_traceability_data
+  some tc in item.test_cases    # you might need to adjust field name
+  test_case := tc
+}
+
+# -----------------------------------------------------------------
+# 2) Build a quick mapping from testCaseId -> [statuses] for sevenos
+# -----------------------------------------------------------------
+sevenos_entry := {
+  test_case: sts |
+  # This partial object will map each test_case to a (possibly) multiple statuses
+  some i
+  test_case := input.sevenos.test.cases[i].testCaseId
+  sts       := [ input.sevenos.test.cases[j].status 
+                 | some j
+                 input.sevenos.test.cases[j].testCaseId == test_case 
+               ]
+}
+
+# -----------------------------------------------------------------
+# 3) Define a helper rule to check if a list of statuses is valid
+# -----------------------------------------------------------------
+valid_status(status_list) {
+  # For at least one status in status_list to be in valid_statuses
+  some s
+  s := status_list[_]
+  s in valid_statuses
+}
+
+# If you need *all* statuses to be valid, do:
+# valid_status(status_list) {
+#   # no invalid statuses
+#   not exists_invalid(status_list)
+# }
+# exists_invalid(status_list) {
+#   s := status_list[_]
+#   s not in valid_statuses
+# }
+
+# -----------------------------------------------------------------
+# 4) Missing JIRA IDs: JIRA IDs in `input.jira_data` but not in traceability?
+# -----------------------------------------------------------------
+missing_jira_ids := {
+  j |
+  j := jira_ids[_]
+  not j in { t.jira_id | t := input.traceability_data[_] }
+}
+
+# -----------------------------------------------------------------
+# 5) Missing test cases: 
+#   a) test case not found in sevenos at all, or 
+#   b) has statuses that are not valid
+# -----------------------------------------------------------------
+
+# a) testCase not found in sevenos_entry
+missing_test_case_ids_not_in_sevenos := {
+  tc |
+  tc := unique_iica_test_cases[_]
+  not sevenos_entry[tc]  # means there's no key == tc in sevenos_entry
+}
+
+# b) testCase is in sevenos_entry but all statuses are invalid
+missing_test_case_ids_invalid_status := {
+  tc |
+  tc := unique_iica_test_cases[_]
+  sts := sevenos_entry[tc]
+  # If it has statuses but none are valid:
+  not valid_status(sts)
+}
+
+missing_test_case_ids := 
+  missing_test_case_ids_not_in_sevenos 
+  union 
+  missing_test_case_ids_invalid_status
+
+# -----------------------------------------------------------------
+# 6) Summaries and Final Decision
+# -----------------------------------------------------------------
+
+results := {
+  "missing_id_automated": missing_test_case_ids_out,
+  "missing_jiraids":      missing_jira_ids_out,
+  "total_traceability_tests": count(unique_iica_test_cases),
+  "valid_traceability_tests": count(unique_iica_test_cases) - count(missing_test_case_ids),
+  "decision": decision
+}
+
+missing_test_case_ids_out := [ x | x := missing_test_case_ids[_] ]
+missing_jira_ids_out      := [ j | j := missing_jira_ids[_] ]
+
+default decision = "FAIL"
+
+decision = "PASS" {
+  count(missing_test_case_ids) == 0
+  count(missing_jira_ids) == 0
+}
+
+
+
+
+---------------------------------------------------------------
+
+
+Explanation of the Refactoring
+1) Sets for Membership
+jira_ids, valid_traceability_data, unique_iica_test_cases, sevenos_entry, etc. are now defined as partial sets or objects. This makes membership tests and differences more performant than repeatedly searching arrays.
+
+2) Partial Objects
+
+sevenos_entry is a partial object mapping testCaseId → [statuses]. This means each key is a testCaseId, and its value is an array of statuses. Once built, we can do a constant-time lookup sevenos_entry[someId].
+
+3) Simplified Missing Logic
+
+Instead of multiple rules with repeated loops, we define:
+missing_jira_ids once (the set of JIRA IDs not present in traceability).
+missing_test_case_ids_not_in_sevenos for test cases that don’t appear in sevenos_entry.
+missing_test_case_ids_invalid_status for test cases that appear in sevenos_entry but fail the valid_status(...) check.
+Then combine them into missing_test_case_ids.
+
+4) Final Results
+
+Instead of repeating the code that checks counts and sets the same keys, we build one “results” object.
+We store sets in the final object as arrays (so it’s easy to see the actual missing items in the decision response).
+The final “decision” is determined by checking if these missing sets are empty.
+
+--- Why This is Faster ---
+Single-Pass Generation of Key Data Structures: We define sevenos_entry once, and after that, any reference to sevenos_entry[someCaseId] is O(1).
+
+Set Operations: Checking membership in a set is generally more efficient than scanning arrays.
+
+Reduced Repetition: Minimizing repeated partial logic avoids multiple some i, some j enumerations.
+
+----------------------------------------------------
+
+Tip: If you need even finer control over performance, you can measure how Rego executes your policy using OPA’s built-in performance metrics (e.g., opa eval with --metrics or the REST API with ?metrics=true). Look for repeated calls and large iteration counts. Then move computations into partial rules or sets to reduce repeated enumerations.
+
+This structure keeps your policy logic declarative, leverages sets for membership checks, and avoids repeated iteration over the same arrays—leading to a clearer and more performant OPA policy.
