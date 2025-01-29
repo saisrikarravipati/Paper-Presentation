@@ -1,1 +1,388 @@
+################ automated_test_validation.rego ##############
+# This policy checks automated test case traceability against Jira IDs
+# and ensures that associated test cases have valid statuses.
+# It aggregates results into the 'results' document.
+
+package policy.enforcement.TMM.automated_test_validation
+
+# Importing data and helper functions
+import data.policy.lib.data
+import data.policy.lib.functions.match_test_names
+import data.policy.lib.functions.sanitize_test_names
+import data.policy.lib.functions.in_array
+import data.policy.lib.functions.is_empty_or_undefined
+import data.policy.lib.functions.valid_automated_status
+import data.policy.lib.functions.length_string
+import rego.v1
+
+##############################################################################
+# sevenps_entry
+# -------------
+# Aggregates all statuses of each testCaseId from "input.sevenps_test_cases".
+# The result is a partial object mapping:
+#     sevenps_entry["someTestCaseId"] = [ "PASS", "FAIL", ... ]
+#
+# Example: 
+#   If input.sevenps_test_cases = [
+#        {"testCaseId": "TC1", "status": "PASS"},
+#        {"testCaseId": "TC1", "status": "FAIL"},
+#        {"testCaseId": "TC2", "status": "PASS"}
+#   ]
+#   Then sevenps_entry = {
+#       "TC1": ["PASS", "FAIL"],
+#       "TC2": ["PASS"]
+#   }
+##############################################################################
+sevenps_entry[test_case] := tc_status if {
+    some i
+    test_case == input.sevenps_test_cases[i].testCaseId
+    tc_status := [status |
+        some j
+        input.sevenps_test_cases[j].testCaseId == test_case
+        status := input.sevenps_test_cases[j].status
+    ]
+}
+
+##############################################################################
+# sanitized_sevenps_entry
+# -----------------------
+# Same as sevenps_entry, but the key is sanitized using 'sanitize_test_names'.
+# This is just a demonstration if we needed sanitized keys. Currently not used 
+# below, but shown here for example or potential usage.
+##############################################################################
+sanitized_sevenps_entry[test_case] := tc_status if {
+    some original_test_case
+    sevenps_entry[original_test_case] == tc_status
+    test_case := sanitize_test_names(original_test_case)
+}
+
+##############################################################################
+# traceability_jira_ids
+# ---------------------
+# Partial set containing *all* jira_ids from input.traceability_data.
+# We store them so we can check membership easily.
+##############################################################################
+traceability_jira_ids contains jira_id if {
+    some i
+    traceability_item := input.traceability_data[i]
+    jira_id := traceability_item.jira_id
+}
+
+##############################################################################
+# valid_traceability_data
+# -----------------------
+# Partial set containing *only* traceability_data items
+# whose jira_id is found in input.jira_data.
+##############################################################################
+valid_traceability_data contains item if {
+    some i
+    item := input.traceability_data[i]
+    item.jira_id in input.jira_data
+}
+
+##############################################################################
+# unique_jira_test_cases
+# ----------------------
+# Partial set containing test cases aggregated from "valid_traceability_data".
+# Each valid traceability item can hold multiple test_cases. We gather them.
+#
+# For example, if valid_traceability_data = [
+#   {"jira_id":"JIRA-1","test_cases":["TC-1","TC-2"]},
+#   {"jira_id":"JIRA-2","test_cases":["TC-3"]}
+# ]
+# Then unique_jira_test_cases = {"TC-1","TC-2","TC-3"}.
+##############################################################################
+unique_jira_test_cases contains test_case if {
+    # Flatten the nested test_cases from each valid item
+    jira_items := [entry.test_cases | entry := valid_traceability_data[_]]
+    jira_item := jira_items[_]
+    some tc in jira_item
+    test_case := tc
+}
+
+##############################################################################
+# jira_test_case_statuses
+# -----------------------
+# 1) For a test_case that exactly matches sevenps_entry, return its statuses.
+# 2) If no exact match in sevenps_entry, attempt regex matching or partial
+#    name matching in the next rule.
+##############################################################################
+jira_test_case_statuses[test_case] := status if {
+    test_case := unique_jira_test_cases[_]
+    status := sevenps_entry[test_case]
+}
+
+# If the test_case from Jira has no exact match in sevenps_entry, 
+# then we do a fallback partial/regex match across the known keys in sevenps_entry.
+jira_test_case_statuses[test_case_regex] := tc_status if {
+    test_case_regex := unique_jira_test_cases[_]
+    not sevenps_entry[test_case_regex]
+    # We'll sanitize inside the match logic if needed
+    tc_status := [status |
+        some key
+        status_list := sevenps_entry[key]
+        match_test_names(test_case_regex, key)
+        status := status_list[_]
+    ]
+}
+
+##############################################################################
+# valid_status
+# ------------
+# Returns true if ANY status in 'status_list' is in the global data.valid_automated_test_case_status.
+##############################################################################
+valid_status(status_list) if {
+    status_list[_] == s
+    valid_automated_status(s)
+}
+
+##############################################################################
+# missing_jira_ids
+# ----------------
+# A partial set of JIRA IDs that appear in input.jira_data 
+# but are missing in 'traceability_jira_ids'.
+##############################################################################
+missing_jira_ids contains jira_id if {
+    jira_id := input.jira_data[_]
+    not in_array(traceability_jira_ids, jira_id)
+}
+
+##############################################################################
+# missing_test_case_id
+# --------------------
+# This partial set identifies test cases (from unique_jira_test_cases) 
+# that either do not appear at all in sevenps_entry or do not have 
+# a valid status.
+#
+# NOTE:
+#  - The old code had 'count(test_id) > 8' and 'count(test_case) > 0'.
+#    'count()' in Rego doesn't work on strings as length-of-string; 
+#    we replaced that with 'length_string()' from functions.rego.
+#  - We define two sub-rules with 'contains' to reflect the original pattern.
+##############################################################################
+
+# 1) Not found in jira_test_case_statuses at all
+missing_test_case_id contains test_id if {
+    test_id := unique_jira_test_cases[_]
+    not jira_test_case_statuses[test_id]
+    length_string(test_id) > 8
+}
+
+# 2) Found in jira_test_case_statuses but status is not valid
+missing_test_case_id contains test_case if {
+    test_case := unique_jira_test_cases[_]
+    not valid_status(jira_test_case_statuses[test_case])
+    length_string(test_case) > 0
+}
+
+##############################################################################
+# Final Results
+# -------------
+# We store final decisions & counts into the 'results' object.
+##############################################################################
+results["missing_id_automated"] := missing_test_case_id if {
+    count(missing_test_case_id) > 0
+} else := []
+
+results["missing_jira_ids"] := missing_jira_ids if {
+    count(missing_jira_ids) > 0
+} else := []
+
+# If nothing missing at all, PASS. Otherwise, FAIL.
+results["decision"] := "PASS" if {
+    count(missing_test_case_id) == 0
+    count(missing_jira_ids) == 0
+} else := "FAIL"
+
+# Total number of unique test cases from valid traceability data
+results["total_traceability_tests"] := test_count if {
+    test_count := count(unique_jira_test_cases)
+} else := 0
+
+# Count how many are valid vs. how many are missing
+results["valid_traceability_tests"] := valid_count if {
+    total_count := count(unique_jira_test_cases)
+    missing_count := count(missing_test_case_id)
+    valid_count := total_count - missing_count
+} else := 0
+
+
+
+
+
+
+###################################################################
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+################# functions.rego ####################
+# Contains helper functions and regex-based matching logic
+
+package policy.lib.functions
+import rego.v1
+
+# Define constants for patterns to match test case strings
+end_pattern_1 := `:?--@[0-9]+?.[0-9]+?.*`
+end_pattern_2 := `#[0-9]+?(\.?[0-9]+)?`
+end_pattern_3 := `\(example#[0-9]\)`
+start_pattern := `\[[0-9]+?(?:\.[0-9]+?)?:[0-9]+\]`
+
+##############################################################################
+# is_empty_or_undefined(response)
+# -------------------------------
+# Returns true if 'response' is undefined or empty in typical ways.
+##############################################################################
+is_empty_or_undefined(response) if {
+    not response
+} else if {
+    response == ""
+} else if {
+    response == {}
+} else if {
+    response == []
+}
+
+##############################################################################
+# in_array(arr, elem)
+# -------------------
+# True if 'elem' is found in array or set 'arr'.
+# Original logic used arr[_] == elem, we keep it for syntax parity.
+##############################################################################
+in_array(arr, elem) if {
+    arr[_] == elem
+}
+
+##############################################################################
+# valid_automated_status
+# ----------------------
+# Helper that checks if a status is in data.valid_automated_test_case_status.
+# This is a "function" used by 'valid_status' to keep code DRY.
+##############################################################################
+valid_automated_status(s) {
+    s in data.valid_automated_test_case_status
+}
+
+##############################################################################
+# match_test_names(test_case_name, test_result_name)
+# --------------------------------------------------
+# 1) Quick substring check: 'test_case_name' in 'test_result_name'.
+# 2) If that passes, we do deeper checks in match_sanitized_test_names.
+# Returns false otherwise.
+##############################################################################
+match_test_names(test_case_name, test_result_name) if {
+    contains(test_result_name, test_case_name)
+    match_sanitized_test_names(test_case_name, test_result_name)
+} else := false
+
+##############################################################################
+# match_sanitized_test_names(sanitized_test_case_name, sanitized_test_result_name)
+# ------------------------------------------------------------------------------
+# Actual series of regex or substring checks to consider variants of the name:
+#   1) Exact match
+#   2) Matches with pattern appended, e.g. "TC1:--@1.0..."
+#   3) Matches with #1.2 etc.
+#   4) Enclosed with a starting pattern [1.2:1234]
+#   5) Bracket expansions <...> or {...}
+#
+# If none of these match, returns false.
+##############################################################################
+match_sanitized_test_names(sanitized_test_case_name, sanitized_test_result_name) if {
+    # 1) exact
+    sanitized_test_case_name == sanitized_test_result_name
+} else if {
+    # 2) pattern with end_pattern_1 (":?--@[0-9]+?.[0-9]+?.*")
+    pattern := sprintf("%s%s", [sanitized_test_case_name, end_pattern_1])
+    regex.template_match(pattern, sanitized_test_result_name, "S", "F")
+} else if {
+    # 3) pattern with end_pattern_2 ("#[0-9]+?(\.?[0-9]+)?")
+    pattern := sprintf("%s%sF", [sanitized_test_case_name, end_pattern_2])
+    regex.template_match(pattern, sanitized_test_result_name, "S", "F")
+} else if {
+    # 4) pattern with end_pattern_3 ("\(example#[0-9]\)")
+    pattern := sprintf("%s%s", [sanitized_test_case_name, end_pattern_3])
+    regex.template_match(pattern, sanitized_test_result_name, "S", "F")
+} else if {
+    # 5) optional start pattern ("[0-9]+?(?:.[0-9]+?)?:[0-9]+") preceding 
+    pattern := sprintf("%s%s", [start_pattern, sanitized_test_case_name])
+    regex.template_match(pattern, sanitized_test_result_name, "S", "F")
+} else if {
+    # 6) For cases containing angle brackets <...>
+    contains(sanitized_test_case_name, "<")
+    contains(sanitized_test_case_name, ">")
+    substrings_of_test_case := regex.split(`<(.*?)>`, sanitized_test_case_name)
+    count({ ss | 
+        substrings_of_test_case[ss]
+        contains(sanitized_test_result_name, substrings_of_test_case[ss])
+    }) == count(substrings_of_test_case)
+} else if {
+    # 7) For cases containing curly braces {...}
+    contains(sanitized_test_case_name, "{")
+    contains(sanitized_test_case_name, "}")
+    substrings_of_test_case := regex.split(`{(.*?)}`, sanitized_test_case_name)
+    count({ ss |
+        substrings_of_test_case[ss]
+        contains(sanitized_test_result_name, substrings_of_test_case[ss])
+    }) == count(substrings_of_test_case)
+} else := false
+
+##############################################################################
+# sanitize_test_names(test_name)
+# ------------------------------
+# 1) Lower-case the name, remove spaces.
+# 2) Replace any literal "\u003e" or "\u003c" or "\u203a" with '>' or '<'.
+# 3) Remove any backslashes \.
+##############################################################################
+sanitize_test_names(test_name) := sanitized_test_name if {
+    lowered_no_spaces_name := lower(replace(test_name, " ", ""))
+    unicode_literal_test_name := replace(
+        replace(
+            replace(lowered_no_spaces_name, "\\u203a", ">"), 
+        "\\u003e", ">"), 
+    "\\u003c", "<")
+    sanitized_test_name := replace(unicode_literal_test_name, `\`, ``)
+} else := test_name
+
+##############################################################################
+# fmt_number_to_string(n)
+# -----------------------
+# Converts a number to string:
+#   - If float/double, format as "%.2f"
+#   - Otherwise, as a standard integer.
+##############################################################################
+fmt_number_to_string(n) := f if {
+    # case 1: try formatting as float
+    f := sprintf("%.2f", [n])
+    contains(f, ".")
+} else := f if {
+    # case 2: integer-like
+    not contains(sprintf("%.2f", [n]), ".")
+    f := sprintf("%v", [n])
+} else := n
+
+##############################################################################
+# length_string(str)
+# ------------------
+# Because 'count(str)' does not directly work on strings,
+# we define a helper to get the character length of a string 
+# by splitting it into an array of individual characters.
+##############################################################################
+length_string(str) = length if {
+    arr := split(str, "")
+    length := count(arr)
+}
+
 
