@@ -1,20 +1,97 @@
+package policy.enforcement.TMM.automated_test_validation
+
+import data.policy.lib.data
+import data.policy.lib.functions.match_test_names
+import data.policy.lib.functions.sanitize_test_names
+import rego.v1
+
+sanitized_test_map := {tc: {
+    "original": original,
+    "sanitized": sanitize_test_names(original),
+    "statuses": [status | status := input.sevenps_test_cases[_].status; input.sevenps_test_cases[_].testCaseId == original]
+} | original := input.sevenps_test_cases[_].testCaseId}
+
+sevenps_entry := {tc: statuses |
+    item := sanitized_test_map[tc]
+    statuses := item.statuses
+}
+
+sanitized_sevenps_entry := {item.sanitized: statuses |
+    item := sanitized_test_map[_]
+    statuses := item.statuses
+}
+
+traceability_jira_ids := {jira_id |
+    traceability_item := input.traceability_data[_]
+    jira_id := traceability_item.jira_id
+}
+
+valid_traceability_data := {item |
+    item := input.traceability_data[_]
+    item.jira_id in input.jira_data
+}
+
+unique_jira_test_cases := {tc |
+    entry := valid_traceability_data[_]
+    tc := entry.test_cases[_]
+}
+
+jira_test_case_statuses[test_case] := status if {
+    test_case := unique_jira_test_cases[_]
+    status := sevenps_entry[test_case]
+}
+
+jira_test_case_statuses[test_case] := status if {
+    test_case := unique_jira_test_cases[_]
+    not sevenps_entry[test_case]
+    sanitized := sanitize_test_names(test_case)
+    status := sanitized_sevenps_entry[sanitized][_]
+}
+
+jira_test_case_statuses[test_case] := status if {
+    test_case := unique_jira_test_cases[_]
+    not sevenps_entry[test_case]
+    not sanitized_sevenps_entry[sanitize_test_names(test_case)]
+    sanitized_test := sanitize_test_names(test_case)
+    some key in keys(sanitized_sevenps_entry)
+    match_test_names(sanitized_test, key)
+    status := sanitized_sevenps_entry[key][_]
+}
+
+valid_status(status_list) if {
+    status := status_list[_]
+    status in data.valid_automated_test_case_status
+}
+
+missing_jira_ids := {jira_id |
+    jira_id := input.jira_data[_]
+    not jira_id in traceability_jira_ids
+}
+
+missing_test_case_id := {test_id |
+    test_id := unique_jira_test_cases[_]
+    not jira_test_case_statuses[test_id]
+    count(test_id) > 8
+} | {test_case |
+    test_case := unique_jira_test_cases[_]
+    not valid_status(jira_test_case_statuses[test_case])
+    count(test_case) > 0
+}
+
+# FINAL CORRECTED RESULTS SECTION
 results["missing_id_automated"] := missing_test_case_id {
     count(missing_test_case_id) > 0
-} else := ""
+} else := set()
 
 results["missing_jira_ids"] := missing_jira_ids { 
     count(missing_jira_ids) > 0 
-} else := []
+} else := set()
 
 results["decision"] := "PASS" {
     count(missing_test_case_id) == 0
     count(missing_jira_ids) == 0
 } else := "FAIL"
 
-results["total_traceability_tests"] := test_count { 
-    test_count := count(unique_jira_test_cases) 
-} else := 0
+results["total_traceability_tests"] := count(unique_jira_test_cases)
 
-results["valid_traceability_tests"] := valid_count {
-    valid_count := count(unique_jira_test_cases) - count(missing_test_case_id)
-} else := 0
+results["valid_traceability_tests"] := count(unique_jira_test_cases) - count(missing_test_case_id)
