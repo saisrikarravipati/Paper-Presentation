@@ -5,54 +5,70 @@ import data.policy.lib.functions.match_test_names
 import data.policy.lib.functions.sanitize_test_names
 import rego.v1
 
+# Precomputed test case data with safe variable binding
 sanitized_test_map := {tc: {
-    "original": original,
-    "sanitized": sanitize_test_names(original),
+    "original": tc,
+    "sanitized": sanitize_test_names(tc),
     "statuses": [status | 
-        status := input.sevenps_test_cases[_].status
-        input.sevenps_test_cases[_].testCaseId == original
+        some i
+        status := input.sevenps_test_cases[i].status
+        input.sevenps_test_cases[i].testCaseId == tc
     ]
-} | original := input.sevenps_test_cases[_].testCaseId}
+} | some j; tc := input.sevenps_test_cases[j].testCaseId}
 
+# Direct lookup maps with explicit iteration
 sevenps_entry := {tc: statuses |
+    some k
+    tc := input.sevenps_test_cases[k].testCaseId
     item := sanitized_test_map[tc]
     statuses := item.statuses
 }
 
-sanitized_sevenps_entry := {item.sanitized: statuses |
-    item := sanitized_test_map[_]
+sanitized_sevenps_entry := {sanitized: statuses |
+    some m
+    original := input.sevenps_test_cases[m].testCaseId
+    item := sanitized_test_map[original]
+    sanitized := item.sanitized
     statuses := item.statuses
 }
 
+# Traceability data processing
 traceability_jira_ids := {jira_id |
-    traceability_item := input.traceability_data[_]
+    some n
+    traceability_item := input.traceability_data[n]
     jira_id := traceability_item.jira_id
 }
 
 valid_traceability_data := {item |
-    item := input.traceability_data[_]
+    some p
+    item := input.traceability_data[p]
     item.jira_id in input.jira_data
 }
 
 unique_jira_test_cases := {tc |
-    entry := valid_traceability_data[_]
-    tc := entry.test_cases[_]
+    some q, r
+    entry := valid_traceability_data[q]
+    tc := entry.test_cases[r]
 }
 
+# Test case status resolution with safe variables
 jira_test_case_statuses[test_case] := status if {
-    test_case := unique_jira_test_cases[_]
+    some s
+    test_case := unique_jira_test_cases[s]
     status := sevenps_entry[test_case]
 }
 
 jira_test_case_statuses[test_case] := status if {
-    test_case := unique_jira_test_cases[_]
+    some t
+    test_case := unique_jira_test_cases[t]
     not sevenps_entry[test_case]
     sanitized := sanitize_test_names(test_case)
     status := sanitized_sevenps_entry[sanitized][_]
 }
 
 jira_test_case_statuses[test_case] := status if {
-    test_case := unique_jira_test_cases[_]
+    some u
+    test_case := unique_jira_test_cases[u]
     not sevenps_entry[test_case]
     not sanitized_sevenps_entry[sanitize_test_names(test_case)]
     sanitized_test := sanitize_test_names(test_case)
@@ -62,34 +78,39 @@ jira_test_case_statuses[test_case] := status if {
     status := sanitized_sevenps_entry[key][_]
 }
 
+# Validation helpers
 valid_status(status_list) if {
-    status := status_list[_]
+    some status in status_list
     status in data.valid_automated_test_case_status
 }
 
 missing_jira_ids := {jira_id |
-    jira_id := input.jira_data[_]
+    some v
+    jira_id := input.jira_data[v]
     not jira_id in traceability_jira_ids
 }
 
 missing_test_case_id := {test_id |
-    test_id := unique_jira_test_cases[_]
+    some w
+    test_id := unique_jira_test_cases[w]
     not jira_test_case_statuses[test_id]
     count(test_id) > 8
 } | {test_case |
-    test_case := unique_jira_test_cases[_]
+    some x
+    test_case := unique_jira_test_cases[x]
     not valid_status(jira_test_case_statuses[test_case])
     count(test_case) > 0
 }
 
-results["missing_id_automated"] := missing_test_case_id & {x |
+# Results generation with safe variables
+results["missing_id_automated"] := missing_test_case_id & {y |
     count(missing_test_case_id) > 0
-    x := missing_test_case_id
+    some y; y := missing_test_case_id
 }
 
-results["missing_jira_ids"] := missing_jira_ids & {x |
+results["missing_jira_ids"] := missing_jira_ids & {z |
     count(missing_jira_ids) > 0
-    x := missing_jira_ids
+    some z; z := missing_jira_ids
 }
 
 default decision = "FAIL"
