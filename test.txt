@@ -1,1 +1,293 @@
+package policy.enforcement.TMM.automated_test_validation
+
+# Import your data library and the match_test_names function
+import data.policy.lib.data
+import data.policy.lib.functions.match_test_names
+import rego.v1
+
+###############################################################################
+# sevenps_entry
+#
+# Produces an object where each key is a testCaseId from input.sevenps_test_cases
+# and each value is an array of all statuses found for that testCaseId.
+#
+# This keeps the old code style with `some i`/`some j` comprehensions,
+# but is now in a single object-comprehension rule (no parse errors).
+###############################################################################
+sevenps_entry := {
+  test_case: [status |
+    some j
+    input.sevenps_test_cases[j].testCaseId == test_case
+    status := input.sevenps_test_cases[j].status
+  ] |
+  some i
+  test_case := input.sevenps_test_cases[i].testCaseId
+}
+
+###############################################################################
+# traceability_jira_ids
+#
+# A *partial set* containing all jira_ids from input.traceability_data.
+# Checking membership is O(1) on average (instead of scanning arrays).
+#
+#    traceability_jira_ids[x]  => x is a member
+###############################################################################
+traceability_jira_ids[jira_id] {
+    traceability_item := input.traceability_data[_]
+    jira_id = traceability_item.jira_id
+}
+
+###############################################################################
+# valid_traceability_data
+#
+# A *partial set* containing only those traceability items whose jira_id
+# is listed in input.jira_data.
+###############################################################################
+valid_traceability_data[item] {
+    item := input.traceability_data[_]
+    item.jira_id in input.jira_data
+}
+
+###############################################################################
+# unique_jira_test_cases
+#
+# A *partial set* of all test cases that appear in *valid* traceability data.
+###############################################################################
+unique_jira_test_cases[test_case] {
+    item := valid_traceability_data[_]
+    test_case := item.test_cases[_]
+}
+
+###############################################################################
+# jira_test_case_statuses
+#
+# This is a *partial object* rule that merges two definitions:
+# 1) Exact match: If test_case is in unique_jira_test_cases AND
+#    sevenps_entry[test_case] exists, use that array of statuses.
+# 2) Regex match: If there's no exact match, loop through sevenps_entry keys
+#    and use match_test_names(...) to see if it matches the test_case regex.
+###############################################################################
+
+# 1) Exact match
+jira_test_case_statuses[test_case] := status_list if {
+    test_case in unique_jira_test_cases
+    sevenps_entry[test_case]
+    status_list := sevenps_entry[test_case]
+}
+
+# 2) Regex-based match (only if not an exact match)
+jira_test_case_statuses[test_case_regex] := tc_status if {
+    test_case_regex in unique_jira_test_cases
+    not sevenps_entry[test_case_regex]
+
+    # Gather statuses from all testCaseIds in sevenps_entry that match the regex
+    tc_status := [status |
+        some key
+        status_list := sevenps_entry[key]
+        match_test_names(test_case_regex, key)
+        status := status_list[_]
+    ]
+}
+
+###############################################################################
+# Helper function: in_array(arr, elem)
+#
+# old code style, used for membership in an array.
+###############################################################################
+in_array(arr, elem) {
+    arr[_] = elem
+}
+
+###############################################################################
+# valid_status(status_list)
+#
+# old style rule: true if ANY status in status_list belongs to
+# data.valid_automated_test_case_status. Short-circuits on first match.
+###############################################################################
+valid_status(status_list) {
+    some s
+    s := status_list[_]
+    s in data.valid_automated_test_case_status
+}
+
+###############################################################################
+# missing_jira_ids
+#
+# A *partial set* of those JIRA IDs in input.jira_data that are NOT found in
+# traceability_jira_ids. Checking membership is now straightforward.
+###############################################################################
+missing_jira_ids[jira_id] {
+    jira_id := input.jira_data[_]
+    not jira_id in traceability_jira_ids
+}
+
+###############################################################################
+# missing_test_case_id
+#
+# A *partial set* for test cases that:
+#   1) Do not exist at all in jira_test_case_statuses
+#      (=> no statuses found for them).
+#   2) Or exist in jira_test_case_statuses but do not have ANY valid status.
+###############################################################################
+
+# Case 1: not found in the final statuses at all
+missing_test_case_id[test_case] {
+    test_case in unique_jira_test_cases
+    not jira_test_case_statuses[test_case]
+}
+
+# Case 2: found, but no valid statuses
+missing_test_case_id[test_case] {
+    test_case in unique_jira_test_cases
+    status_list := jira_test_case_statuses[test_case]
+    not valid_status(status_list)
+}
+
+###############################################################################
+# results object
+#
+# We produce "missing_id_automated", "missing_jira_ids", "decision",
+# "total_traceability_tests", and "valid_traceability_tests".
+###############################################################################
+
+results["missing_id_automated"] := { x | x := missing_test_case_id[_] } if {
+    count(missing_test_case_id) > 0
+} else := "" {
+    # If none missing, return ""
+    count(missing_test_case_id) == 0
+}
+
+results["missing_jira_ids"] := { x | x := missing_jira_ids[_] } if {
+    count(missing_jira_ids) > 0
+} else := [] {
+    count(missing_jira_ids) == 0
+}
+
+results["decision"] := "PASS" if {
+    # Old code logic: pass if no missing test cases and no missing jira IDs
+    count(missing_test_case_id) == 0
+    count(missing_jira_ids) == 0
+} else := "FAIL"
+
+results["total_traceability_tests"] := count(unique_jira_test_cases) if {
+    count(unique_jira_test_cases) > 0
+} else := 0
+
+results["valid_traceability_tests"] := valid_count if {
+    total_count := count(unique_jira_test_cases)
+    missing_count := count(missing_test_case_id)
+    valid_count := total_count - missing_count
+} else := 0
+
+
+
+########################################################
+
+package policy.lib.functions
+
+import rego.v1
+
+###############################################################################
+# is_empty_or_undefined(response)
+#
+# Old code style with multiple branches. Returns true if response is "", {}, [], or undefined.
+###############################################################################
+is_empty_or_undefined(response) {
+    not response
+} else {
+    response == ""
+} else {
+    response == {}
+} else {
+    response == []
+}
+
+###############################################################################
+# match_test_names(test_case_name, test_result_name)
+#
+# 1) Sanitize both names (lowercase, remove spaces/backslashes, handle unicode).
+# 2) Delegate to match_sanitized_test_names(...) for various regex patterns.
+###############################################################################
+match_test_names(test_case_name, test_result_name) {
+    sanitized_test_case_name  := sanitize_test_names(test_case_name)
+    sanitized_test_result_name := sanitize_test_names(test_result_name)
+    match_sanitized_test_names(sanitized_test_case_name, sanitized_test_result_name)
+}
+
+###############################################################################
+# match_sanitized_test_names(name1, name2)
+#
+# Multiple branches, short-circuits on the first successful match.
+# Patterns are unchanged, just reorganized for clarity.
+###############################################################################
+match_sanitized_test_names(name1, name2) {
+    # 1) Exact match
+    name1 == name2
+} else {
+    # 2) Pattern: name1 + `7-@[0-9]+7.[0-9]+7.*`
+    end_pattern := `7-@[0-9]+7.[0-9]+7.*`
+    pattern := sprintf("%s%s", [name1, end_pattern])
+    regex.template_match(pattern, name2, "S", "F")
+} else {
+    # 3) Pattern: name1 + `#[0-9]+?F`
+    end_pattern := `#[0-9]+?`
+    pattern := sprintf("%s%sF", [name1, end_pattern])
+    regex.template_match(pattern, name2, "S", "F")
+} else {
+    # 4) Pattern: name1 + `\(example#[0-9]\)`
+    end_pattern := `\(example#[0-9]\)`
+    pattern := sprintf("%s%s", [name1, end_pattern])
+    regex.template_match(pattern, name2, "S", "F")
+} else {
+    # 5) Pattern: `[[0-9]+7(7:[0-9]+7)7:[0-9]+]` + name1
+    start_pattern := `[[0-9]+7(7:[0-9]+7)7:[0-9]+]`
+    pattern := sprintf("%s%s", [start_pattern, name1])
+    regex.template_match(pattern, name2, "S", "F")
+} else {
+    # 6) If name1 contains '<' and '>', split on `<(.*?)>` and ensure
+    #    *all* resulting substrings appear in name2
+    contains(name1, "<")
+    contains(name1, ">")
+    substrings := regex.split(`<(.*?)>`, name1)
+    count({ s | s := substrings[_]; contains(name2, s) }) == count(substrings)
+} else {
+    # 7) If name1 contains '{' and '}', do the same approach as above
+    contains(name1, "{")
+    contains(name1, "}")
+    substrings := regex.split(`<(.*?)>`, name1)
+    count({ s | s := substrings[_]; contains(name2, s) }) == count(substrings)
+}
+
+###############################################################################
+# sanitize_test_names(test_name) => sanitized_test_name
+#
+# 1) Lower + remove spaces
+# 2) Replace known unicode escapes (\u203a, \u003e, \u003c) with literal chars
+# 3) Strip backslashes
+###############################################################################
+sanitize_test_names(test_name) := sanitized_test_name {
+    lowered_no_spaces := lower(replace(test_name, " ", ""))
+
+    step1 := replace(lowered_no_spaces, "\\u203a", ">")
+    step2 := replace(step1, "\\u003e", ">")
+    step3 := replace(step2, "\\u003c", "<")
+
+    sanitized_test_name := replace(step3, `\`, "")
+} else := test_name
+
+###############################################################################
+# fmt_number_to_string(n)
+#
+# 1) If numeric can be float, produce two decimals (e.g. 12.34).
+# 2) If integer, produce integer string (e.g. 12).
+###############################################################################
+fmt_number_to_string(n) := out {
+    # Case: float
+    out := sprintf("%.2f", [n])
+    contains(out, ".")
+} else := out {
+    # Case: integer
+    not contains(sprintf("%.2f", [n]), ".")
+    out := sprintf("%d", [n])
+} else := n
 
