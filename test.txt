@@ -1,25 +1,20 @@
-# Exact match status lookup using precomputed sanitized names
-jira_test_case_statuses[test_case] := status if {
-    test_case := unique_jira_test_cases[_]
-    status := sevenps_entry[test_case]
-}
+results["missing_id_automated"] := missing_test_case_id {
+    count(missing_test_case_id) > 0
+} else := ""
 
-# Sanitized name match fallback
-jira_test_case_statuses[test_case] := status if {
-    test_case := unique_jira_test_cases[_]
-    not sevenps_entry[test_case]  # Only if exact match not found
-    sanitized := sanitize_test_names(test_case)
-    status := sanitized_sevenps_entry[sanitized][_]
-}
+results["missing_jira_ids"] := missing_jira_ids { 
+    count(missing_jira_ids) > 0 
+} else := []
 
-# Regex match fallback with pre-indexed sanitized names
-jira_test_case_statuses[test_case] := status if {
-    test_case := unique_jira_test_cases[_]
-    not sevenps_entry[test_case]
-    not sanitized_sevenps_entry[sanitize_test_names(test_case)]
-    
-    sanitized_test := sanitize_test_names(test_case)
-    some key in keys(sanitized_sevenps_entry)
-    match_test_names(sanitized_test, key)
-    status := sanitized_sevenps_entry[key][_]
-}
+results["decision"] := "PASS" {
+    count(missing_test_case_id) == 0
+    count(missing_jira_ids) == 0
+} else := "FAIL"
+
+results["total_traceability_tests"] := test_count { 
+    test_count := count(unique_jira_test_cases) 
+} else := 0
+
+results["valid_traceability_tests"] := valid_count {
+    valid_count := count(unique_jira_test_cases) - count(missing_test_case_id)
+} else := 0
