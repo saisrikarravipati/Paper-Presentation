@@ -1,1 +1,208 @@
 
+
+
+############### OPTIMIZED automated_test_validation.rego ###############
+package policy.enforcement.TMM.automated_test_validation
+
+import data.policy.lib.functions
+import data.policy.lib.data
+import rego.v1
+
+# SECTION 1: PRE-COMPUTATION AND SETUP
+# ------------------------------------
+# Convert valid status list to set for O(1) lookups
+valid_status_set := {status | 
+    status := data.valid_automated_test_case_status[_]
+}
+
+# Convert JIRA IDs to set for efficient membership checks
+jira_data_set := {id | 
+    id := input.jira_data[_]
+}
+
+# SECTION 2: DATA PROCESSING
+# --------------------------
+# Filter valid traceability items (with existing JIRA IDs)
+valid_traceability_data := {item |
+    item := input.traceability_data[_]
+    item.jira_id in jira_data_set  # Set membership check (O(1))
+}
+
+# Pre-sanitize all JIRA test case names and store in set
+unique_jira_test_cases := {sanitized |
+    item := valid_traceability_data[_]
+    test_case := item.test_cases[_]
+    sanitized := functions.sanitize_test_names(test_case)  # Memoized sanitization
+}
+
+# Create map of sanitized SevenPS test cases with validity status
+sanitized_sevenps_map := {sanitized: status |
+    test_case := input.sevenps_test_cases[_]
+    sanitized := functions.sanitize_test_names(test_case.testCaseId)
+    status := test_case.status in valid_status_set  # Precompute validity
+}
+
+# SECTION 3: VALIDATION LOGIC
+# ---------------------------
+# Helper function for regex matching using pre-sanitized names
+check_regex_match(jira_test_case) := status {
+    # Get all SevenPS test cases that match via regex patterns
+    matching_tests := {test_name |
+        test_name := sanitized_sevenps_map[test_name]
+        functions.match_test_names(jira_test_case, test_name)
+    }
+    
+    status := count(matching_tests) > 0  # True if any matches found
+} else := false
+
+# Determine test case statuses using exact match first, then regex
+jira_test_case_statuses := {test_case: status |
+    test_case := unique_jira_test_cases[_]
+    status := sanitized_sevenps_map[test_case]  # Direct lookup
+} | {test_case: status |
+    test_case := unique_jira_test_cases[_]
+    not sanitized_sevenps_map[test_case]  # Only check regex if no exact match
+    status := check_regex_match(test_case)
+}
+
+# SECTION 4: RESULT CALCULATION
+# -----------------------------
+# Calculate missing JIRA IDs using set difference
+missing_jira_ids := jira_data_set - {id | 
+    id := input.traceability_data[_].jira_id
+}
+
+# Identify missing test cases using set operations
+missing_test_case_id := {test_case |
+    test_case := unique_jira_test_cases[_]
+    not jira_test_case_statuses[test_case]  # Automatic validity check
+}
+
+# SECTION 5: FINAL RESULTS
+# ------------------------
+results := {
+    # Missing automated test case IDs
+    "missing_id_automated": missing_test_case_id,
+    
+    # JIRA IDs not found in traceability data
+    "missing_jira_ids": missing_jira_ids,
+    
+    # Overall decision based on missing elements
+    "decision": "PASS" if 
+        count(missing_test_case_id) == 0 &&
+        count(missing_jira_ids) == 0 
+        else "FAIL",
+    
+    # Metrics for reporting
+    "total_traceability_tests": count(unique_jira_test_cases),
+    "valid_traceability_tests": count(unique_jira_test_cases) - count(missing_test_case_id)
+}
+
+############### OPTIMIZED functions.rego ###############
+package policy.lib.functions
+import rego.v1
+
+# SANITIZATION FUNCTION
+# ---------------------
+# Optimized test name normalization using single-pass regex replacements
+sanitize_test_names(test_name) := sanitized {
+    sanitized := regex.replace_all(
+        regex.replace_all(
+            regex.replace_all(
+                # Step 1: Lowercase and remove spaces
+                lower(replace(test_name, " ", "")),
+                # Step 2: Replace common unicode literals
+                "(\\\\u203a|\\\\u003e)",
+                ">"
+            ),
+            # Step 3: Replace remaining unicode literals
+            "\\\\u003c",
+            "<"
+        ),
+        # Step 4: Remove any leftover backslashes
+        "[\\\\]+",
+        ""
+    )
+}
+
+# PATTERN MATCHING FUNCTION
+# -------------------------
+match_test_names(test_case_name, test_result_name) := true {
+    # Case 1: Direct match after sanitization
+    test_case_name == test_result_name
+} else := true {
+    # Case 2: Template patterns with optimized regex
+    end_patterns := [
+        `7-@[0-9]+7.[0-9]+7.*`,    # Version patterns
+        `#[0-9]+?F`,               # Numbered test variants
+        `\(example#[0-9]\)`,       # Example markers
+        `[[0-9]+7(7:[0-9]+7)7:[0-9]+].*`  # Complex numbering
+    ]
+    
+    # Check if any pattern matches using template matching
+    any {
+        regex.template_match(test_case_name + patterns, test_result_name, "S", "F")
+        patterns := end_patterns[_]
+    }
+} else := true {
+    # Case 3: Component-based matching for parameterized tests
+    (contains(test_case_name, "<") || contains(test_case_name, "{")) &&
+    all_substrings_match(test_case_name, test_result_name)
+} else := false
+
+# HELPER FUNCTION FOR COMPONENT MATCHING
+# --------------------------------------
+all_substrings_match(test_case, result_name) := true {
+    pattern := "(<[^>]+>|\\{[^}]+\\})"  # Capture parameter blocks
+    substrings := regex.split(pattern, test_case)
+    # Verify all components exist in result name
+    count({s | s := substrings[_]; contains(result_name, s)}) == count(substrings)
+}
+
+### SAMPLE INPUT/OUTPUT 1 (FAIL CASE) ###
+/*
+INPUT:
+{
+  "sevenps_test_cases": [
+    {"testCaseId": "TC-001", "status": "PASS"},
+    {"testCaseId": "TC-002", "status": "INVALID"}  # Status not in valid set
+  ],
+  "traceability_data": [
+    {"jira_id": "JIRA-123", "test_cases": ["TC-001", "TC-002"]}
+  ],
+  "jira_data": ["JIRA-123", "JIRA-456"]
+}
+
+OUTPUT:
+{
+  "decision": "FAIL",
+  "missing_id_automated": {"TC-002"},  # Has invalid status
+  "missing_jira_ids": {"JIRA-456"},    # Not in traceability
+  "total_traceability_tests": 2,
+  "valid_traceability_tests": 1
+}
+*/
+
+### SAMPLE INPUT/OUTPUT 2 (PASS CASE) ###
+/*
+INPUT:
+{
+  "sevenps_test_cases": [
+    {"testCaseId": "TC-101", "status": "PASS"},
+    {"testCaseId": "TC-102(Example#1)", "status": "PASS"}
+  ],
+  "traceability_data": [
+    {"jira_id": "JIRA-789", "test_cases": ["TC-101", "TC-102"]}
+  ],
+  "jira_data": ["JIRA-789"]
+}
+
+OUTPUT:
+{
+  "decision": "PASS",
+  "missing_id_automated": set(),
+  "missing_jira_ids": set(),
+  "total_traceability_tests": 2,
+  "valid_traceability_tests": 2
+}
+*/
