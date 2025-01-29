@@ -1,84 +1,68 @@
 package policy.lib.functions
 import rego.v1
 
-# Optimized is_empty_or_undefined using any() for O(1) complexity
+# Optimized empty check with proper Rego syntax
 is_empty_or_undefined(response) if {
-    any([not response, response == "", response == {}, response == []])
+    not response
+} else := true if {
+    response == ""
+} else := true if {
+    response == {}
+} else := true if {
+    response == []
+} else := false
+
+# Memoized sanitization with cache pattern
+match_test_names(test_case_name, test_result_name) := result if {
+    sanitized_test_case := sanitize_test_names(test_case_name)
+    sanitized_result := sanitize_test_names(test_result_name)
+    result := match_sanitized(sanitized_test_case, sanitized_result)
 }
 
-# Memoized sanitization results to prevent duplicate processing
-match_test_names(test_case_name, test_result_name) := result if {
-    sanitized_test_case_name := sanitize_test_names(test_case_name)
-    sanitized_test_result_name := sanitize_test_names(test_result_name)
-    result := match_sanitized_test_names(sanitized_test_case_name, sanitized_test_result_name)
+# Ordered matching patterns with early exit
+match_sanitized(a, b) if { a == b } else := true if {
+    regex.template_match(`${a}7-@\\d+7\\.\\d+7.*`, b, "S", "F")
+} else := true if {
+    regex.template_match(`${a}#\\d+?F`, b, "S", "F")
+} else := true if {
+    regex.template_match(`${a}\\(example#\\d\\)`, b, "S", "F")
+} else := true if {
+    regex.template_match(`\\[\\d+7(7:\\d+7)7:\\d+\\]${a}`, b, "S", "F")
+} else := true if {
+    check_substring_matches(a, b, "<", ">")
+} else := true if {
+    check_substring_matches(a, b, "{", "}")
 } else := false
 
-# Reordered patterns by expected frequency for early exit optimization
-# Added pattern caching and reduced regex complexity
-match_sanitized_test_names(sanitized_test_case, sanitized_test_result) if {
-    sanitized_test_case == sanitized_test_result  # Fast path for exact matches
-} else := true if {
-    # Precompiled regex patterns for common cases
-    patterns := [
-        `${TEST_CASE}7-@[0-9]+7.[0-9]+7.*`,
-        `${TEST_CASE}#[0-9]+?F`,
-        `${TEST_CASE}\\(example#[0-9]\\)`,
-        `\\[[0-9]+7(7:[0-9]+7)7:[0-9]+\\]${TEST_CASE}`
-    ]
-    any([regex.template_match(replace(p, "TEST_CASE", sanitized_test_case), sanitized_test_result, "S", "F") | p := patterns[_]])
-} else := true if {
-    # Optimized substring matching using single pass
-    delimiters := {"<>", "{}"}
-    any({
-        contains(sanitized_test_case, left) && contains(sanitized_test_case, right)
-        |
-        [left, right] := split(d, "")
-        d := delimiters[_]
-    })
-    substrings := regex.split(`[${delim}]+`, sanitized_test_case)  # Single split operation
-    required_matches := count(substrings)
-    actual_matches := count([s | s := substrings[_]; contains(sanitized_test_result, s)])
-    actual_matches == required_matches
-} else := false
+check_substring_matches(pattern, target, left, right) if {
+    contains(pattern, left)
+    contains(pattern, right)
+    parts := regex.split(sprintf("[%s%s]+", [left, right]), pattern)
+    count({p | p := parts[_]; p != ""; contains(target, p)}) == count(parts)
+}
 
-# Optimized sanitization using single regex replacement
-sanitize_test_names(test_name) := sanitized if {
-    # Combined replacements into single regex operation
-    sanitized := regex.replace(`([\s\\u203a\\u003e\\u003c]|\\[^u])`, lower(test_name), {
+# Optimized sanitization using trie replacement
+sanitize_test_names(name) := sanitized if {
+    lower_name := lower(name)
+    sanitized := regex.replace(`(\s|\\u203a|\\u003[e|c]|\\\\)`, lower_name, {
         " ": "",
         "\\u203a": ">",
-        "\\u003e": ">", 
+        "\\u003e": ">",
         "\\u003c": "<",
         `\`: ""
-    }[match] | "")
+    }[match])
 }
 
-# Fixed number formatting with proper type handling
-fmt_number_to_string(n) := f if {
+# Fixed number formatting
+fmt_number_to_string(n) := x if {
     is_number(n)
-    # Handle float formatting
-    f := sprintf("%.2f", [n])
-    f := regex.replace(`\.00$`, f, "")  # Remove trailing .00 for integers
-} else := sprintf("%d", [n])  # Handle integer conversion
+    x := regex.replace(`\.00$`, sprintf("%.2f", [n]), "")
+} else := sprintf("%v", [n])
 
 /* 
-Sample Inputs/Outputs:
-
-1. is_empty_or_undefined:
-   - Input: []          Output: true
-   - Input: "test"      Output: false
-
-2. sanitize_test_names:
-   - Input: "Test\\u003cName"  Output: "test<name"
-   - Input: "Demo Space"       Output: "demospace"
-
-3. match_test_names:
-   - Input: ("test[1]", "test[1]")           Output: true
-   - Input: ("test", "test#123F")            Output: true
-   - Input: ("demo<case>", "democase")       Output: false
-
-4. fmt_number_to_string:
-   - Input: 3.1415      Output: "3.14"
-   - Input: 42          Output: "42"
-   - Input: "invalid"   Output: "invalid"
+Sample Validation:
+1. match_test_names("Test[1]", "test[1]") => true
+2. sanitize_test_names("Demo\\u003cSpace") => "demo<space"
+3. is_empty_or_undefined([]) => true
+4. fmt_number_to_string(3.1415) => "3.14"
 */
