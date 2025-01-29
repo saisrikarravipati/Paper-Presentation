@@ -1,211 +1,25 @@
-package policy.enforcement.TMM.automated_test_validation
-
-import data.policy.lib.data
-import data.policy.lib.functions.match_test_names
-import data.policy.lib.functions.sanitize_test_names
-import rego.v1
-
-# Precompute all test case IDs with their sanitized names and statuses
-sanitized_test_map := {tc: {
-    "original": original,
-    "sanitized": sanitize_test_names(original),
-    "statuses": [status | status := input.sevenps_test_cases[_].status; input.sevenps_test_cases[_].testCaseId == original]
-} | original := input.sevenps_test_cases[_].testCaseId}
-
-# Direct lookup maps for O(1) access
-sevenps_entry := {tc: statuses |
-    item := sanitized_test_map[tc]
-    statuses := item.statuses
-}
-
-sanitized_sevenps_entry := {item.sanitized: statuses |
-    item := sanitized_test_map[_]
-    statuses := item.statuses
-}
-
-# Set of all Jira IDs from traceability data
-traceability_jira_ids := {jira_id |
-    traceability_item := input.traceability_data[_]
-    jira_id := traceability_item.jira_id
-}
-
-# Precompute valid traceability entries (Jira IDs present in input.jira_data)
-valid_traceability_data := {item |
-    item := input.traceability_data[_]
-    item.jira_id in input.jira_data
-}
-
-# Set of all unique test cases from valid traceability data
-unique_jira_test_cases := {tc |
-    entry := valid_traceability_data[_]
-    tc := entry.test_cases[_]
-}
-
 # Exact match status lookup using precomputed sanitized names
 jira_test_case_statuses[test_case] := status if {
     test_case := unique_jira_test_cases[_]
-    # Check both original and sanitized versions
     status := sevenps_entry[test_case]
-} else := status if {
+}
+
+# Sanitized name match fallback
+jira_test_case_statuses[test_case] := status if {
     test_case := unique_jira_test_cases[_]
+    not sevenps_entry[test_case]  # Only if exact match not found
     sanitized := sanitize_test_names(test_case)
-    status := sanitized_sevenps_entry[sanitized]
+    status := sanitized_sevenps_entry[sanitized][_]
 }
 
 # Regex match fallback with pre-indexed sanitized names
-jira_test_case_statuses[test_case] := tc_status if {
+jira_test_case_statuses[test_case] := status if {
     test_case := unique_jira_test_cases[_]
-    not jira_test_case_statuses[test_case]  # Only process unmatched cases
+    not sevenps_entry[test_case]
+    not sanitized_sevenps_entry[sanitize_test_names(test_case)]
     
     sanitized_test := sanitize_test_names(test_case)
-    tc_status := [status |
-        # Check against precomputed sanitized entries
-        sanitized_key := sanitized_sevenps_entry[_]
-        match_test_names(sanitized_test, sanitized_key)
-        status := sanitized_sevenps_entry[sanitized_key][_]
-    ]
+    some key in keys(sanitized_sevenps_entry)
+    match_test_names(sanitized_test, key)
+    status := sanitized_sevenps_entry[key][_]
 }
-
-# Helper function replaced with native 'in' operator
-valid_status(status_list) if {
-    status := status_list[_]
-    status in data.valid_automated_test_case_status
-}
-
-missing_jira_ids := {jira_id |
-    jira_id := input.jira_data[_]
-    not jira_id in traceability_jira_ids
-}
-
-missing_test_case_id := {test_id |
-    test_id := unique_jira_test_cases[_]
-    not jira_test_case_statuses[test_id]
-    count(test_id) > 8
-} | {test_case |
-    test_case := unique_jira_test_cases[_]
-    not valid_status(jira_test_case_statuses[test_case])
-    count(test_case) > 0
-}
-
-results := {
-    "missing_id_automated": missing_test_case_id if count(missing_test_case_id) > 0 else "",
-    "missing_jira_ids": missing_jira_ids if count(missing_jira_ids) > 0 else [],
-    "decision": "PASS" if 
-        count(missing_test_case_id) == 0 &&
-        count(missing_jira_ids) == 0 
-        else "FAIL",
-    "total_traceability_tests": count(unique_jira_test_cases) else 0,
-    "valid_traceability_tests": count(unique_jira_test_cases) - count(missing_test_case_id) else 0
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-package policy.lib.functions
-import rego.v1
-
-# Compile regex patterns once using variables
-end_pattern_1 := `:?--@\d+?\.\d+?.*`
-end_pattern_2 := `#\d+?(?:\.\d+)?`
-end_pattern_3 := `\(example#\d\)`
-start_pattern := `\[\d+?(?:\.\d+?)?:\d+\]`
-
-is_empty_or_undefined(response) if {
-    response == null
-} else := true if {
-    response == ""
-} else := true if {
-    response == {}
-} else := true if {
-    response == []
-} else := false
-
-match_test_names(test_case_name, test_result_name) if {
-    # Use pre-sanitized names for matching
-    sanitized_tc := sanitize_test_names(test_case_name)
-    sanitized_tr := sanitize_test_names(test_result_name)
-    match_sanitized_test_names(sanitized_tc, sanitized_tr)
-}
-
-match_sanitized_test_names(tc, tr) if {
-    tc == tr
-} else := true if {
-    regex.template_match(tc + end_pattern_1, tr, "S", "F")
-} else := true if {
-    regex.template_match(tc + end_pattern_2 + "F", tr, "S", "F")
-} else := true if {
-    regex.template_match(tc + end_pattern_3, tr, "S", "F")
-} else := true if {
-    regex.template_match(start_pattern + tc, tr, "S", "F")
-} else := true if {
-    contains_angle_brackets(tc) &&
-    all_substrings_match(tc, tr, `<`)
-} else := true if {
-    contains_curly_braces(tc) &&
-    all_substrings_match(tc, tr, `{`)
-} else := false
-
-contains_angle_brackets(s) if {
-    contains(s, "<")
-    contains(s, ">")
-}
-
-contains_curly_braces(s) if {
-    contains(s, "{")
-    contains(s, "}")
-}
-
-all_substrings_match(tc, tr, delimiter) if {
-    pattern := sprintf(`%s(.*?)%s`, [delimiter, delimiter])
-    substrings := regex.split(pattern, tc)
-    required_count := count(substrings) - 1  # Split returns n+1 elements
-    matched_count := count({s | 
-        s := substrings[_]
-        s != ""
-        contains(tr, s)
-    })
-    matched_count >= required_count
-}
-
-sanitize_test_names(test_name) := sanitized if {
-    # Single pass replacement pipeline
-    sanitized := replace(
-        replace(
-            replace(
-                replace(
-                    lower(replace(test_name, " ", "")),
-                    "\\u203a", ">"
-                ),
-                "\\u003e", ">"
-            ),
-            "\\u003c", "<"
-        ),
-        `\`, ``
-    )
-} else := test_name
-
-fmt_number_to_string(n) := x if {
-    # Optimized number formatting
-    x := sprintf("%.2f", [n])
-    contains(x, ".")
-} else := sprintf("%d", [n])
