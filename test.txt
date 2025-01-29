@@ -1,9 +1,9 @@
 ###########################################################
 # automated_test_validation.rego
 #
-# Refactored to avoid using 'or' in the rule body.
-# Instead, we collect missing test cases in two separate
-# partial sets, then unify them.
+# Eliminates both the "or" keyword *and* the "else" usage
+# in partial sets. Instead, we define multiple partial
+# rules for `missing_test_case_id`.
 ###########################################################
 
 package policy.enforcement.TMM.automated_test_validation
@@ -37,8 +37,8 @@ traceability_jira_ids := {
 }
 
 ###########################################################
-# 3) Valid traceability data = only items whose jira_id
-#    is in input.jira_data
+# 3) Valid traceability data
+#    => items whose jira_id is in input.jira_data
 ###########################################################
 valid_traceability_data := {
   vt |
@@ -47,7 +47,7 @@ valid_traceability_data := {
 }
 
 ###########################################################
-# 4) Unique test cases from valid_traceability_data
+# 4) Set of test cases from valid_traceability_data
 ###########################################################
 unique_jira_test_cases := {
   testC |
@@ -56,8 +56,8 @@ unique_jira_test_cases := {
 }
 
 ###########################################################
-# 5) Gather statuses for each test case.
-#    - If no direct match, fallback to regex.
+# 5) For each test case, gather statuses from sevenps_entry.
+#    If no direct key => fallback to regex-based match.
 ###########################################################
 
 # Exact match
@@ -80,7 +80,7 @@ jira_test_case_statuses[test_case] := regex_statuses if {
 }
 
 ###########################################################
-# 6) Missing JIRA IDs in input.jira_data but not in
+# 6) Missing JIRA IDs: in input.jira_data but not in
 #    traceability_jira_ids
 ###########################################################
 missing_jira_ids contains jira_id if {
@@ -89,19 +89,28 @@ missing_jira_ids contains jira_id if {
 }
 
 ###########################################################
-# 7) Split "missing or invalid" logic into two partial sets,
-#    then unify them in `missing_test_case_id`.
+# 7) Missing test case IDs
 #
-#    A) missing_empty_test_cases = cases with empty or
-#       undefined statuses
-#    B) missing_invalid_test_cases = cases with statuses
-#       present but no valid status found
+# Instead of "or", define two partial sets:
+#
+# A) missing_empty_test_cases: statuses are empty or undefined
+# B) missing_invalid_test_cases: statuses exist but none are valid
+#
+# Then unify them by defining multiple partial-set rules for
+# missing_test_case_id:
+#    - 1st rule picks up empty
+#    - 2nd rule picks up invalid
+#
+# This way, we do not use "or" or "else" in partial sets.
 ###########################################################
+
+# 7a) Cases with empty or undefined statuses
 missing_empty_test_cases[test_case] if {
   test_case := unique_jira_test_cases[_]
   is_empty_or_undefined(jira_test_case_statuses[test_case])
 }
 
+# 7b) Cases with statuses, but no valid status
 missing_invalid_test_cases[test_case] if {
   test_case := unique_jira_test_cases[_]
   statuses := jira_test_case_statuses[test_case]
@@ -109,10 +118,12 @@ missing_invalid_test_cases[test_case] if {
   not valid_status(statuses)
 }
 
-# missing_test_case_id = union of both sets
-missing_test_case_id contains test_case if {
+# 7c) missing_test_case_id is effectively the union of the two:
+missing_test_case_id[test_case] if {
   missing_empty_test_cases[test_case]
-} else {
+}
+
+missing_test_case_id[test_case] if {
   missing_invalid_test_cases[test_case]
 }
 
