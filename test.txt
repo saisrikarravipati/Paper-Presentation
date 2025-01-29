@@ -1,12 +1,21 @@
 # FINAL WORKING RESULTS SECTION
-results["missing_id_automated"] := missing_test_case_id & {x | count(missing_test_case_id) > 0; x := missing_test_case_id}
+results["missing_id_automated"] := missing_test_case_id & {x | 
+    count(missing_test_case_id) > 0
+    x := missing_test_case_id
+}
 
-results["missing_jira_ids"] := missing_jira_ids & {x | count(missing_jira_ids) > 0; x := missing_jira_ids}
+results["missing_jira_ids"] := missing_jira_ids & {x | 
+    count(missing_jira_ids) > 0
+    x := missing_jira_ids
+}
 
-results["decision"] := "PASS" {
+default decision = "FAIL"
+decision = "PASS" {
     count(missing_test_case_id) == 0
     count(missing_jira_ids) == 0
-} else := "FAIL"
+}
+
+results["decision"] := decision
 
 results["total_traceability_tests"] := count(unique_jira_test_cases)
 
