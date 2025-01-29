@@ -5,122 +5,194 @@ import data.policy.lib.functions.match_test_names
 import data.policy.lib.functions.sanitize_test_names
 import rego.v1
 
-# Precomputed test case data with safe variable binding
-sanitized_test_map := {tc: {
-    "original": tc,
-    "sanitized": sanitize_test_names(tc),
-    "statuses": [status | 
-        some i
-        status := input.sevenps_test_cases[i].status
-        input.sevenps_test_cases[i].testCaseId == tc
+sevenps_entry := {test_case: tc_status |
+    some i
+    test_case = input.sevenps_test_cases[i].testCaseId
+    tc_status = [status |
+        some j
+        input.sevenps_test_cases[j].testCaseId == test_case
+        status = input.sevenps_test_cases[j].status
     ]
-} | some j; tc := input.sevenps_test_cases[j].testCaseId}
+}
 
-# Direct lookup maps with explicit iteration
-sevenps_entry := {tc: statuses |
+sanitized_sevenps_entry := {test_case: tc_status |
     some k
-    tc := input.sevenps_test_cases[k].testCaseId
-    item := sanitized_test_map[tc]
-    statuses := item.statuses
+    original_test_case = input.sevenps_test_cases[k].testCaseId
+    tc_status = sevenps_entry[original_test_case]
+    test_case = sanitize_test_names(original_test_case)
 }
 
-sanitized_sevenps_entry := {sanitized: statuses |
+traceability_jira_ids contains jira_id if {
     some m
-    original := input.sevenps_test_cases[m].testCaseId
-    item := sanitized_test_map[original]
-    sanitized := item.sanitized
-    statuses := item.statuses
+    traceability_item = input.traceability_data[m]
+    jira_id = traceability_item.jira_id
 }
 
-# Traceability data processing
-traceability_jira_ids := {jira_id |
+valid_traceability_data contains item if {
     some n
-    traceability_item := input.traceability_data[n]
-    jira_id := traceability_item.jira_id
-}
-
-valid_traceability_data := {item |
-    some p
-    item := input.traceability_data[p]
+    item = input.traceability_data[n]
     item.jira_id in input.jira_data
 }
 
-unique_jira_test_cases := {tc |
-    some q, r
-    entry := valid_traceability_data[q]
-    tc := entry.test_cases[r]
+unique_jira_test_cases contains test_case if {
+    some p, q
+    entry = valid_traceability_data[p]
+    jira_item = entry.test_cases[q]
+    test_case = jira_item
 }
 
-# Test case status resolution with safe variables
-jira_test_case_statuses[test_case] := status if {
+jira_test_case_statuses[test_case] = status if {
+    some r
+    test_case = unique_jira_test_cases[r]
+    status = sevenps_entry[test_case]
+}
+
+jira_test_case_statuses[test_case] = tc_status if {
     some s
-    test_case := unique_jira_test_cases[s]
-    status := sevenps_entry[test_case]
-}
-
-jira_test_case_statuses[test_case] := status if {
+    test_case = unique_jira_test_cases[s]
+    not sevenps_entry[test_case]
+    test_case_regex_2 = sanitize_test_names(test_case)
     some t
-    test_case := unique_jira_test_cases[t]
-    not sevenps_entry[test_case]
-    sanitized := sanitize_test_names(test_case)
-    status := sanitized_sevenps_entry[sanitized][_]
+    key = sanitized_sevenps_entry[t]
+    match_test_names(test_case_regex_2, t)
+    tc_status = sevenps_entry[key]
 }
 
-jira_test_case_statuses[test_case] := status if {
+in_array(arr, elem) = true if {
     some u
-    test_case := unique_jira_test_cases[u]
-    not sevenps_entry[test_case]
-    not sanitized_sevenps_entry[sanitize_test_names(test_case)]
-    sanitized_test := sanitize_test_names(test_case)
-    some key
-    sanitized_sevenps_entry[key]
-    match_test_names(sanitized_test, key)
-    status := sanitized_sevenps_entry[key][_]
+    arr[u] = elem
 }
 
-# Validation helpers
-valid_status(status_list) if {
-    some status in status_list
-    status in data.valid_automated_test_case_status
-}
-
-missing_jira_ids := {jira_id |
+valid_status(status_list) = true if {
     some v
-    jira_id := input.jira_data[v]
-    not jira_id in traceability_jira_ids
+    status = status_list[v]
+    in_array(data.valid_automated_test_case_status, status)
 }
 
-missing_test_case_id := {test_id |
+missing_jira_ids contains jira_id if {
     some w
-    test_id := unique_jira_test_cases[w]
+    jira_id = input.jira_data[w]
+    not in_array(traceability_jira_ids, jira_id)
+}
+
+missing_test_case_id contains test_id if {
+    some x
+    test_id = unique_jira_test_cases[x]
     not jira_test_case_statuses[test_id]
     count(test_id) > 8
-} | {test_case |
-    some x
-    test_case := unique_jira_test_cases[x]
+}
+
+missing_test_case_id contains test_case if {
+    some y
+    test_case = unique_jira_test_cases[y]
     not valid_status(jira_test_case_statuses[test_case])
     count(test_case) > 0
 }
 
-# Results generation with safe variables
-results["missing_id_automated"] := missing_test_case_id & {y |
+results["missing_id_automated"] = missing_test_case_id if {
     count(missing_test_case_id) > 0
-    some y; y := missing_test_case_id
-}
+} else = ""
 
-results["missing_jira_ids"] := missing_jira_ids & {z |
+results["missing_jira_ids"] = missing_jira_ids if {
     count(missing_jira_ids) > 0
-    some z; z := missing_jira_ids
-}
+} else = []
 
-default decision = "FAIL"
-decision = "PASS" {
+results["decision"] = "PASS" if {
     count(missing_test_case_id) == 0
     count(missing_jira_ids) == 0
-}
+} else = "FAIL"
 
-results["decision"] := decision
+results["total_traceability_tests"] = test_count if {
+    test_count = count(unique_jira_test_cases)
+} else = 0
 
-results["total_traceability_tests"] := count(unique_jira_test_cases)
+results["valid_traceability_tests"] = valid_count if {
+    total_count = count(unique_jira_test_cases)
+    missing_count = count(missing_test_case_id)
+    valid_count = total_count - missing_count
+} else = 0
 
-results["valid_traceability_tests"] := count(unique_jira_test_cases) - count(missing_test_case_id)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#########################################################
+
+
+
+
+
+
+
+package policy.lib.functions
+import rego.v1
+
+end_pattern_1 = `:?--@[0-9]+?.[0-9]+?.*`
+end_pattern_2 = `#[0-9]+?(\.?[0-9]+)?`
+end_pattern_3 = `\(example#[0-9]\)`
+start_pattern = `[[0-9]+?(?:.[0-9]+?)?:[0-9]+]`
+
+is_empty_or_undefined(response) = true if {
+    not response
+} else = true if {
+    response == ""
+} else = true if {
+    response == {}
+} else = true if {
+    response == []
+} else = false
+
+match_test_names(test_case_name, test_result_name) = true if {
+    contains(test_result_name, test_case_name)
+    match_sanitized_test_names(test_case_name, test_result_name)
+} else = false
+
+match_sanitized_test_names(sanitized_test_case_name, sanitized_test_result_name) = true if {
+    sanitized_test_case_name == sanitized_test_result_name
+} else = true if {
+    pattern = sprintf("%s%s", [sanitized_test_case_name, end_pattern_1])
+    regex.template_match(pattern, sanitized_test_result_name, "S", "F")
+} else = true if {
+    pattern = sprintf("%s%sF", [sanitized_test_case_name, end_pattern_2])
+    regex.template_match(pattern, sanitized_test_result_name, "S", "F")
+} else = true if {
+    pattern = sprintf("%s%s", [sanitized_test_case_name, end_pattern_3])
+    regex.template_match(pattern, sanitized_test_result_name, "S", "F")
+} else = true if {
+    pattern = sprintf("%s%s", [start_pattern, sanitized_test_case_name])
+    regex.template_match(pattern, sanitized_test_result_name, "S", "F")
+} else = false
+
+sanitize_test_names(test_name) = sanitized_test_name if {
+    lowered_no_spaces_name = lower(replace(test_name, " ", ""))
+    step1 = replace(lowered_no_spaces_name, "\\u203a", ">")
+    step2 = replace(step1, "\\u003e", ">")
+    step3 = replace(step2, "\\u003c", "<")
+    sanitized_test_name = replace(step3, `\`, ``)
+} else = test_name
+
+fmt_number_to_string(n) = f if {
+    f = sprintf("%.2f", [n])
+    contains(f, ".")
+} else = f if {
+    f = sprintf("%d", [n])
+} else = n
