@@ -1,1 +1,68 @@
+import os
+import json
+import gzip
+import requests
+
+def compress_json_file(input_json_path: str, output_gzip_path: str) -> None:
+    """
+    Reads a JSON file, compresses it using GZIP, and writes the result to output_gzip_path.
+    """
+    try:
+        with open(input_json_path, 'r', encoding='utf-8') as json_file:
+            data = json.load(json_file)
+
+        with gzip.open(output_gzip_path, 'wt', encoding='utf-8') as gzip_file:
+            json.dump(data, gzip_file)
+
+        print(f"[INFO] Successfully compressed '{input_json_path}' to '{output_gzip_path}'")
+    except Exception as e:
+        print(f"[ERROR] Failed to compress JSON file: {e}")
+        raise
+
+def post_gzip_data_to_opa(
+    gzip_filepath: str,
+    url: str,
+    token: str
+) -> None:
+    """
+    Sends a POST request to the OPA endpoint with the GZIP-compressed payload.
+    """
+    # Prepare headers. 
+    # NOTE: 'Content-Encoding: gzip' signals that the request body is gzipped.
+    #       'Accept': 'application/json;v=2' matches your usage example.
+    #       'Authorization': 'Bearer <token>' is a placeholder token for demonstration.
+    headers = {
+        'Accept': 'application/json;v=2',
+        'Authorization': f'Bearer {token}',
+        'Content-Encoding': 'gzip',
+        # 'Content-Type': 'application/json' --> if the endpoint explicitly requires it
+    }
+
+    try:
+        with open(gzip_filepath, 'rb') as compressed_file:
+            response = requests.post(url, headers=headers, data=compressed_file, verify=False)
+            print("[INFO] OPA Response Status Code:", response.status_code)
+            print("[INFO] OPA Response Body:", response.text)
+    except Exception as e:
+        print(f"[ERROR] Failed to POST gzip data to OPA: {e}")
+        raise
+
+def main():
+    # Example usage. Adjust paths, token, and URL as appropriate.
+    # 1. Paths for input and output files:
+    input_json_path = os.path.join("resources", "test_input.json")
+    output_gzip_path = os.path.join("resources", "test_input.json.gz")
+
+    # 2. OPA endpoint and token (replace <token> with a real token)
+    opa_url = "https://api-it.cloud.capitalone.com/private/1057890/enterprise-opa-evaluation"
+    bearer_token = "<YOUR_AUTH_TOKEN>"
+
+    # Step 1: Compress
+    compress_json_file(input_json_path, output_gzip_path)
+
+    # Step 2: POST
+    post_gzip_data_to_opa(output_gzip_path, opa_url, bearer_token)
+
+if __name__ == "__main__":
+    main()
 
