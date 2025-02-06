@@ -1,1 +1,132 @@
+# File: utils/gzip_opa.py
+
+import os
+import json
+import gzip
+import time
+import logging
+import requests
+import io
+
+# Importing your existing code to show we are not touching it
+# (e.g., from my_repo.opa_decision import OpaDecision, or however your import path is)
+# from your_project.main import OpaDecision    # Example import
+# from your_project.main import get_opa_decision  # If get_opa_decision was a top-level function
+
+logger = logging.getLogger(__name__)
+
+# If your OPA path is a constant you have elsewhere, define it or reuse it
+EXCHANGE_OPA_PATH = "/private/1057890/enterprise-opa-evaluation"
+
+
+def compress_dict_to_gzip_bytes(data_dict: dict) -> bytes:
+    """
+    Compresses a Python dict into Gzip-compressed JSON bytes (in-memory).
+    """
+    json_str = json.dumps(data_dict)
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode='wb') as gz_file:
+        gz_file.write(json_str.encode('utf-8'))
+    return buffer.getvalue()
+
+
+def send_gzipped_opa_request(
+    input_data: dict, 
+    policy_group: str, 
+    policy_path: str,
+    token: str,
+    exchange_host: str = None
+) -> dict:
+    """
+    Sends a Gzip-compressed JSON request to the OPA endpoint **without modifying**
+    the existing get_opa_decision or OpaDecision class.
+    
+    :param input_data: The 'input' portion of the OPA payload.
+    :param policy_group: The OPA policy group identifier.
+    :param policy_path: The OPA policy path identifier.
+    :param token: The Bearer token for authentication.
+    :param exchange_host: The base host for the request. Defaults to ENV if not provided.
+    :return: The 'result' field from the OPA response, or an empty dict if missing.
+    """
+
+    # If exchange_host is not provided, fall back to environment
+    if not exchange_host:
+        exchange_host = os.getenv("EXCHANGE_HOST", "https://api-it.cloud.capitalone.com")
+
+    # Build the URL
+    url = f"{exchange_host}{EXCHANGE_OPA_PATH}"
+
+    # Construct the body as a dict exactly like get_opa_decision does
+    body_data = {
+        "policy_group": policy_group,
+        "policy_path": policy_path,
+        "input": input_data,
+    }
+
+    # Compress the JSON
+    compressed_payload = compress_dict_to_gzip_bytes(body_data)
+
+    # Prepare headers
+    headers = {
+        "Accept": "application/json;v=2",
+        "Authorization": f"Bearer {token}",
+        "Content-Encoding": "gzip",         # critical
+        "Content-Type": "application/json"  # so server knows data is JSON after decompress
+    }
+
+    logger.debug("Sending Gzipped OPA request...")
+    start_time = time.time()
+
+    # Perform the request (synchronous requests library)
+    response = requests.post(
+        url,
+        headers=headers,
+        data=compressed_payload,
+        verify=False  # or True, depending on your SSL requirements
+    )
+
+    duration = time.time() - start_time
+    logger.debug(f"OPA Response status: {response.status_code}, took {duration:.2f}s")
+
+    # Raise an exception for non-2xx responses if desired
+    # response.raise_for_status()
+
+    # Safely parse JSON
+    try:
+        resp_json = response.json()
+        logger.debug(f"OPA JSON Response: {resp_json}")
+        return resp_json.get("result", {})
+    except ValueError:
+        logger.error("Failed to parse JSON from OPA response.")
+        return {}
+
+
+
+
+-----------------------------------
+
+
+
+# Some file, e.g., in a test or another module:
+from utils.gzip_opa import send_gzipped_opa_request
+
+def example_usage():
+    # Typically you’d get your token from DevExRequestor or environment
+    token = "<YOUR_BEARER_TOKEN>"
+
+    # Example input data (whatever your OPA policy expects)
+    input_payload = {"some_key": "some_value"}
+
+    # Policy details
+    policy_group = "somePolicyGroup"
+    policy_path = "somePolicyPath"
+
+    # Make the compressed request
+    result = send_gzipped_opa_request(
+        input_data=input_payload,
+        policy_group=policy_group,
+        policy_path=policy_path,
+        token=token
+    )
+    print("OPA result:", result)
 
