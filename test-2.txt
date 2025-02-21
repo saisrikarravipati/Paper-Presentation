@@ -1,235 +1,137 @@
-
-
-package policy.enforcement.scope
-
-import data.policy.lib.data
-import rego.v1
-
-# Constant dates used in the policy.
-IN_SCOPE_CUTOFF_DATE := "2024-05-15T00:00:00Z"
-
-# A repository is considered "net new" if its creation date is after 2024-04-01T00:00:00Z.
-net_new_cutoff_ns := time.parse_rfc3339_ns("2024-04-01T00:00:00Z")
-
-# Calculate the repository creation timestamp.
-# We first try to parse using a custom format, then fall back to RFC3339.
-repo_creation_timestamp := ts {
-    ts = time.parse_ns("2006-01-02T15:04:05", input.repoCreationDate)
-} else := time.parse_rfc3339_ns(input.repoCreationDate)
-
-###############################################################################
-# Current Time (Default Only)
-###############################################################################
-# In production we always use the default current time.
-# In tests, we override this value using the "with" keyword.
-current_time_ns = time.now_ns()
-
-###############################################################################
-# New Computed Values and Flags
-###############################################################################
-
-# Flag 1: is_repo_net_new
-# True if the repository creation timestamp is after the net new cutoff.
-is_repo_net_new = value {
-    value = repo_creation_timestamp > net_new_cutoff_ns
-}
-
-# Compute the full enforcement date by adding 60 days to the repository creation timestamp.
-# 60 days in nanoseconds = 60 * 24 * 3600 * 1e9 = 5184000000000.
-# The result is then formatted as an ISO8601 date string.
-full_enforcement_Date = enforcement_date {
-    enforcement_due_ns = time.add_ns(repo_creation_timestamp, 5184000000000)
-    enforcement_date = time.format_ns(enforcement_due_ns, "2006-01-02T15:04:05Z07:00")
-}
-
-# Flag 2: is_repo_fully_enforced
-# True if the repo is net new and at least 60 days have passed since repo creation.
-is_repo_fully_enforced = value {
-    value = (repo_creation_timestamp > net_new_cutoff_ns) and (current_time_ns >= time.add_ns(repo_creation_timestamp, 5184000000000))
-}
-
-###############################################################################
-# Existing Policy Logic
-###############################################################################
-
-results := response if {
-    all_decisions := [decision |
-        some res in scope_results
-        decision := res.decision
-    ]
-    all_messages := [message |
-        some res in scope_results
-        message := res.message
-    ]
-    decision := make_decision(all_decisions)
-    response := {
-        "policy_name": "Enforcement Scope policy",
-        "decision": decision,
-        "messages": all_messages,
-        "isRepoInEtbScope": ETBinScope,
-        # Add the new flags and formatted full enforcement date to the response:
-        "is_repo_net_new": is_repo_net_new,
-        "is_repo_fully_enforced": is_repo_fully_enforced,
-        "full_enforcement_Date": full_enforcement_Date,
-    }
-}
-
-scope_results contains decision if {
-    in_scope_pipeline = true
-    decision := {
-        "message": "pass repo app type, date, and flavor in scope",
-        "policy_name": "Enforcement Scope policy",
-        "decision": "true",
-    }
-}
-
-scope_results contains decision if {
-    ETBinScope
-    decision := {
-        "message": "pass repo in ETB list",
-        "policy_name": "Enforcement Scope policy",
-        "decision": "true",
-    }
-}
-
-scope_results contains decision if {
-    not ETBinScope
-    not lower(input.pipelineAppType) in data.valid_types.valid_pipeline_app_type
-    decision := {
-        "message": "App type is not application",
-        "policy_name": "Enforcement Scope policy",
-        "decision": "false",
-    }
-}
-
-scope_results contains decision if {
-    not ETBinScope
-    not input.pipelineFlavor in data.scope_flavors
-    decision := {
-        "message": "Flavor is not in scope",
-        "policy_name": "Enforcement Scope policy",
-        "decision": "false",
-    }
-}
-
-scope_results contains decision if {
-    not ETBinScope
-    out_of_scope_date = true
-    decision := {
-        "message": "repo is not in scope",
-        "policy_name": "Enforcement Scope policy",
-        "decision": "false",
-    }
-}
-
-ETBinScope if {
-    lower(input.repoUrl) in data.ETB_list
-} else {
-    false
-}
-
-in_scope_pipeline if {
-    lower(input.pipelineAppType) in data.valid_types.valid_pipeline_app_type
-    input.pipelineFlavor in data.scope_flavors
-    in_scope_date = true
-}
-
-in_scope_date if {
-    cutoff_time = time.parse_rfc3339_ns(IN_SCOPE_CUTOFF_DATE)
-    repo_creation_timestamp >= cutoff_time
-}
-
-out_of_scope_date if {
-    input.repoCreationDate != ""
-    cutoff_time = time.parse_rfc3339_ns(IN_SCOPE_CUTOFF_DATE)
-    repo_creation_timestamp < cutoff_time
-}
-
-in_scope_date if {
-    input.repoCreationDate = ""
-}
-
-make_decision(decisions) := result if {
-    "false" in decisions
-    result := "false"
-} else := result if {
-    "true" in decisions
-    result := "true"
-} else := ""  # default value if no decisions match
-
-
-
-
----------------------------------------------
-
-
 package policy.enforcement.scope_test
 
 import data.policy.enforcement.scope
 
-# Helper to compute the expected enforcement date as a formatted string.
-expected_enforcement_date(creation, expected) {
-    creation_ns := time.parse_rfc3339_ns(creation)
-    enforcement_ns := time.add_ns(creation_ns, 60 * 24 * 3600 * 1000000000)
-    expected := time.format_ns(enforcement_ns, "2006-01-02T15:04:05Z07:00")
-}
-
 # Test when the repository is net new and exactly 60 days have passed.
+# - The repo is created on "2024-04-02T00:00:00Z", which is after the net new cutoff ("2024-04-01T00:00:00Z").
+# - We compute the expected enforcement date by adding 60 days to the creation date.
+# - We override the current time (using "with") to exactly match the expected enforcement date.
+# - We then assert that:
+#     - is_repo_net_new is true.
+#     - is_repo_fully_enforced is true (because the current time equals the enforcement date).
+#     - The full_enforcement_Date returned by the policy is the expected formatted date string.
 test_net_new_and_fully_enforced {
+    # Repository creation date (net new because it's after "2024-04-01T00:00:00Z")
     creation := "2024-04-02T00:00:00Z"
-    expected_enforcement := expected_enforcement_date(creation, _)
+    
+    # Compute the expected enforcement date:
+    # 1. Parse the creation date into a timestamp (in nanoseconds).
+    # 2. Add 60 days (converted to nanoseconds) to that timestamp.
+    # 3. Format the resulting timestamp into an ISO8601 date string.
+    expected_enforcement := time.format_ns(
+        time.add_ns(time.parse_rfc3339_ns(creation), 60 * 24 * 3600 * 1000000000),
+        "2006-01-02T15:04:05Z07:00"
+    )
+    
+    # Build the input document with necessary fields.
     input := {
         "repoCreationDate": creation,
-        "repoUrl": "dummy_repo",
-        "pipelineAppType": "application",  # assumed valid per data.valid_types.valid_pipeline_app_type
-        "pipelineFlavor": "flavorA",         # assumed valid per data.scope_flavors
+        "repoUrl": "dummy_repo",            # Dummy URL for testing ETB scope logic.
+        "pipelineAppType": "application",    # Assumed valid per data.valid_types.valid_pipeline_app_type.
+        "pipelineFlavor": "flavorA",         # Assumed valid per data.scope_flavors.
     }
+    
+    # Evaluate the net new flag from the policy.
     net_new := scope.is_repo_net_new with input as input
+    
+    # Evaluate the fully enforced flag.
+    # Here, we override the current time to be the expected enforcement time.
     fully_enforced := scope.is_repo_fully_enforced with input as input with policy.enforcement.scope.current_time_ns as time.parse_rfc3339_ns(expected_enforcement)
+    
+    # Retrieve the computed full enforcement date from the policy.
     full_due := scope.full_enforcement_Date with input as input
 
+    # Assert the expected outcomes.
     net_new == true
     fully_enforced == true
     full_due == expected_enforcement
 }
 
 # Test when the repository is net new but less than 60 days have passed.
+# - The repository is still created on "2024-04-02T00:00:00Z".
+# - We compute the expected enforcement date the same way as before.
+# - We simulate the current time as 30 days after the creation date.
+# - Since 30 days is less than the required 60 days, we expect:
+#     - is_repo_net_new to be true.
+#     - is_repo_fully_enforced to be false.
+#     - full_enforcement_Date remains as the computed date (60 days after creation).
 test_net_new_but_not_fully_enforced {
     creation := "2024-04-02T00:00:00Z"
-    expected_enforcement := expected_enforcement_date(creation, _)
-    # Simulate current time as 30 days after creation.
+    
+    # Compute expected enforcement date by adding 60 days to creation.
+    expected_enforcement := time.format_ns(
+        time.add_ns(time.parse_rfc3339_ns(creation), 60 * 24 * 3600 * 1000000000),
+        "2006-01-02T15:04:05Z07:00"
+    )
+    
+    # Simulate current time as 30 days after the creation date.
     simulated_current := time.add_ns(time.parse_rfc3339_ns(creation), 30 * 24 * 3600 * 1000000000)
+    
     input := {
         "repoCreationDate": creation,
         "repoUrl": "dummy_repo",
         "pipelineAppType": "application",
         "pipelineFlavor": "flavorA",
     }
+    
+    # Evaluate net new flag.
     net_new := scope.is_repo_net_new with input as input
+    
+    # Evaluate fully enforced flag using the simulated current time (30 days later).
     fully_enforced := scope.is_repo_fully_enforced with input as input with policy.enforcement.scope.current_time_ns as simulated_current
+    
+    # Get the computed full enforcement date (should always be creation date + 60 days).
     full_due := scope.full_enforcement_Date with input as input
 
+    # Assert that:
+    # - The repo is net new.
+    # - The repo is not fully enforced because current time (30 days later) is less than enforcement date.
+    # - The full enforcement date is correctly computed.
     net_new == true
     fully_enforced == false
     full_due == expected_enforcement
 }
 
 # Test when the repository is not net new.
+# - The repository creation date is set to "2024-03-31T00:00:00Z", which is before the net new cutoff date ("2024-04-01T00:00:00Z").
+# - We compute the expected enforcement date as creation + 60 days.
+# - We simulate the current time as 70 days after creation (a time that would allow full enforcement if the repo were net new).
+# - The expected outcomes are:
+#     - is_repo_net_new is false (since creation is before the cutoff).
+#     - is_repo_fully_enforced is false.
+#     - full_enforcement_Date is computed as creation date + 60 days.
 test_not_net_new {
     creation := "2024-03-31T00:00:00Z"
-    expected_enforcement := expected_enforcement_date(creation, _)
-    # Simulated current time set arbitrarily (e.g., 70 days after creation).
+    
+    # Compute the expected enforcement date (creation + 60 days).
+    expected_enforcement := time.format_ns(
+        time.add_ns(time.parse_rfc3339_ns(creation), 60 * 24 * 3600 * 1000000000),
+        "2006-01-02T15:04:05Z07:00"
+    )
+    
+    # Simulate current time as 70 days after creation.
     simulated_current := time.add_ns(time.parse_rfc3339_ns(creation), 70 * 24 * 3600 * 1000000000)
+    
     input := {
         "repoCreationDate": creation,
         "repoUrl": "dummy_repo",
         "pipelineAppType": "application",
         "pipelineFlavor": "flavorA",
     }
+    
+    # Evaluate net new flag (expected to be false as creation is before cutoff).
     net_new := scope.is_repo_net_new with input as input
+    
+    # Evaluate fully enforced flag with simulated current time.
     fully_enforced := scope.is_repo_fully_enforced with input as input with policy.enforcement.scope.current_time_ns as simulated_current
+    
+    # Retrieve the computed full enforcement date.
     full_due := scope.full_enforcement_Date with input as input
 
+    # Assert expected outcomes:
+    # - The repository is not net new.
+    # - The repository is not fully enforced.
+    # - The computed full enforcement date is as expected.
     net_new == false
     fully_enforced == false
     full_due == expected_enforcement
