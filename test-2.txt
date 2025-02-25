@@ -1,4 +1,1 @@
-mergedAt := time.now_ns() - 61 * 60 * 1000 * 1000 * 1000  # 61 minutes in ns
-[year, month, day] := time.date(mergedAt)
-[hour, minute, second] := time.clock(mergedAt)
-formattedDate := sprintf("%04d-%02d-%02dT%02d:%02d:%02dZ", [year, month, day, hour, minute, second])
+
