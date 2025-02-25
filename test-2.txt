@@ -1,27 +1,26 @@
 
 
-
-
 package policy.enforcement.scope
 
+import data.policy.lib.data
+
 ###############################################################################
-# Constants & Durations
+# Constants
 ###############################################################################
 
 # The date on which a repo is considered to be in scope for ETB
 IN_SCOPE_CUTOFF_DATE := "2024-05-15T00:00:00Z"
 
-# If the repo creation date is strictly after this date, it's considered "net new"
+# If the repo creation date is strictly after this date, it's "net new"
 NET_NEW_CUTOFF_DATE := "2024-04-01T00:00:00Z"
 
-# 60 days expressed as a Go-style duration ("1440h" = 60 days * 24 hours)
-ENFORCEMENT_DURATION_STR := "1440h"
+# 60 days in nanoseconds
+# 60 days * 24 hours/day * 3600 sec/hour * 1e9 ns/sec
+SIXTY_DAYS_NS := 60 * 24 * 3600 * 1000000000
 
 ###############################################################################
-# Repo Creation Timestamp in ns
-# 
-# Some input might be in custom format "2006-01-02T15:04:05",
-# otherwise fallback to RFC3339 parse.
+# Repo Creation Timestamp
+# - Tries a custom format parse, else uses parse_rfc3339_ns
 ###############################################################################
 repo_creation_timestamp := parsed_custom if {
     parsed_custom := time.parse_ns("2006-01-02T15:04:05", input.repoCreationDate)
@@ -30,28 +29,21 @@ repo_creation_timestamp := parsed_custom if {
 }
 
 ###############################################################################
-# Current Time
-# 
-# By default, we use time.now_ns(). Tests can override it with "with".
+# Current Time (Overridable in Tests)
+# - By default uses system time.now_ns()
+# - Must define "default current_time_ns" so that "with current_time_ns as X" works
 ###############################################################################
 default current_time_ns = 0
 current_time_ns = time.now_ns()
 
 ###############################################################################
-# Net-New Cutoff in ns
+# Net-New Cutoff (ns)
 ###############################################################################
 net_new_cutoff_ns := time.parse_rfc3339_ns(NET_NEW_CUTOFF_DATE)
 
 ###############################################################################
-# In-Scope Cutoff in ns
-###############################################################################
-in_scope_cutoff_ns := time.parse_rfc3339_ns(IN_SCOPE_CUTOFF_DATE)
-
-###############################################################################
 # 1) Flag: is_repo_net_new
-#
-# True if the repo creation timestamp is strictly greater than
-# the net-new cutoff (2024-04-01T00:00:00Z).
+#    True if creation date > 2024-04-01T00:00:00Z
 ###############################################################################
 is_repo_net_new = value if {
     value = repo_creation_timestamp > net_new_cutoff_ns
@@ -59,48 +51,33 @@ is_repo_net_new = value if {
 
 ###############################################################################
 # 2) Value: full_enforcement_Date
-#
-# We want an RFC3339 string representing the repo creation date + 60 days.
-# "time.add_duration" is in OPA 0.59.0. It adds 1440h (60 days) to an RFC3339.
-#
-# If your repoCreationDate is parseable only by the custom format, this will
-# not succeed. Adjust if needed. For typical RFC3339 inputs, this works fine.
+#    = (repoCreationTimestamp + 60 days) as an RFC3339-like string
 ###############################################################################
-full_enforcement_Date = enforced_str if {
-    # The user wants an RFC3339 result. We can only add durations to an RFC3339 string.
-    # If the input was parseable by custom format, we won't have a direct string
-    # in RFC3339 format. So let's attempt the fallback approach:
-    some_repo_date := fallback_rfc3339_str
-    enforced_str := time.add_duration(some_repo_date, ENFORCEMENT_DURATION_STR)
-}
+full_enforcement_Date = result_str if {
+    # Compute the numeric timestamp
+    enforced_ts := repo_creation_timestamp + SIXTY_DAYS_NS
 
-# "fallback_rfc3339_str" tries to see if `input.repoCreationDate` is already
-# in standard RFC3339 form. If not, you could do a manual conversion (not trivial)
-# or simply rely on the user to pass valid RFC3339. For many real scenarios,
-# the input is typically in RFC3339, so this works.
-fallback_rfc3339_str := input.repoCreationDate if {
-    # Just a naive check to see if parse_rfc3339_ns doesn't fail.
-    _ := time.parse_rfc3339_ns(input.repoCreationDate)
-}
+    # Extract [year, month, day, hour, minute, second, nsec, weekday]
+    date_parts := time.date_ns(enforced_ts)
+    [year, month, day, hour, minute, second, _, _] := date_parts
 
-# If your environment only uses RFC3339 creation dates, you can
-# skip the custom format parse entirely.
+    # Format an ISO8601-like string (UTC "Z" suffix)
+    result_str := sprintf("%04d-%02d-%02dT%02d:%02d:%02dZ", [year, month, day, hour, minute, second])
+}
 
 ###############################################################################
 # 3) Flag: is_repo_fully_enforced
-#
-# True if:
-#   - The repository is net new (creation > 2024-04-01)
-#   - The current time is >= creation + 60 days
+#    True if:
+#       (a) is_repo_net_new is true
+#       (b) current_time >= creation + 60 days
 ###############################################################################
 is_repo_fully_enforced = result if {
-    # Condition 1: net new
+    # Condition (a)
     repo_creation_timestamp > net_new_cutoff_ns
-    
-    # Condition 2: current_time_ns >= (repo_creation_timestamp + 60 days)
-    # We don't have time.add_ns, so do integer math:
-    enforced_ts_ns := repo_creation_timestamp + 60 * 24 * 3600 * 1000000000
-    current_time_ns >= enforced_ts_ns
+
+    # Condition (b)
+    enforced_ts := repo_creation_timestamp + SIXTY_DAYS_NS
+    current_time_ns >= enforced_ts
 
     result = true
 } else = result if {
@@ -108,7 +85,12 @@ is_repo_fully_enforced = result if {
 }
 
 ###############################################################################
-# Existing "ETBinScope" and "in_scope_pipeline" logic, unchanged
+# In-Scope Cutoff (ns) for older logic
+###############################################################################
+in_scope_cutoff_ns := time.parse_rfc3339_ns(IN_SCOPE_CUTOFF_DATE)
+
+###############################################################################
+# Existing "ETBinScope" / "in_scope_pipeline" / "scope_results" logic
 ###############################################################################
 ETBinScope if {
     lower(input.repoUrl) in data.ETB_list
@@ -135,9 +117,6 @@ in_scope_date if {
     input.repoCreationDate = ""
 }
 
-###############################################################################
-# Combine partial results
-###############################################################################
 scope_results contains decision if {
     in_scope_pipeline = true
     decision := {
@@ -187,13 +166,10 @@ scope_results contains decision if {
 }
 
 ###############################################################################
-# Final "results" Document
-# 
-# We add our new fields "is_repo_net_new", "is_repo_fully_enforced",
-# and "full_enforcement_Date" to the final response.
+# Final Aggregation: results
+# - Adds new flags & computed date to the response
 ###############################################################################
 results := response if {
-    # Gather sub-decisions
     all_decisions := [decision |
         some res in scope_results
         decision := res.decision
@@ -209,10 +185,10 @@ results := response if {
         "decision": decision,
         "messages": all_messages,
 
-        # Original field
+        # Original
         "isRepoInEtbScope": ETBinScope,
 
-        # Newly requested fields
+        # New
         "is_repo_net_new": is_repo_net_new,
         "is_repo_fully_enforced": is_repo_fully_enforced,
         "full_enforcement_Date": full_enforcement_Date,
@@ -220,8 +196,7 @@ results := response if {
 }
 
 ###############################################################################
-# Decide "true" if any sub-decision is "true", "false" if any are "false",
-# else "" if none exist.
+# Utility: make_decision
 ###############################################################################
 make_decision(decisions) := result if {
     "false" in decisions
@@ -233,8 +208,9 @@ make_decision(decisions) := result if {
 
 
 
+-----------------------------
 
-------------------------
+
 
 
 
@@ -244,109 +220,119 @@ package policy.enforcement.scope_test
 import data.policy.enforcement.scope
 
 ###############################################################################
-# Test 1: Net new and exactly 60 days have passed -> fully_enforced == true
+# Helper: add_days_ns
+#
+# Returns an integer that is "base_timestamp_ns + (days × 24h × 3600 × 1e9)"
+###############################################################################
+add_days_ns(base_ns, days) = new_ns {
+    new_ns := base_ns + days * 24 * 3600 * 1000000000
+}
+
+###############################################################################
+# Helper: format_ns_to_rfc3339
+#
+# For comparison, we replicate the same logic as full_enforcement_Date:
+# time.date_ns => sprintf => "YYYY-MM-DDTHH:mm:ssZ".
+###############################################################################
+format_ns_to_rfc3339(ns) = out_str {
+    date_parts := time.date_ns(ns)
+    [year, month, day, hour, minute, second, _, _] := date_parts
+    out_str := sprintf("%04d-%02d-%02dT%02d:%02d:%02dZ", [year, month, day, hour, minute, second])
+}
+
+###############################################################################
+# Test 1: Repo is net new and EXACTLY 60 days have passed => fully_enforced == true
 ###############################################################################
 test_net_new_and_fully_enforced {
-    creation := "2024-04-02T00:00:00Z"
+    creation_str := "2024-04-02T00:00:00Z"
+    creation_ns := time.parse_rfc3339_ns(creation_str)
 
-    # We can produce the expected "full_enforcement_Date" using time.add_duration.
-    expected_enforcement_str := time.add_duration(creation, "1440h")  # 1440h = 60 days
-
-    # "current_time_ns" should be the same as 'creation + 60 days'.
-    # We'll parse 'expected_enforcement_str' back to ns and override current_time_ns.
-    expected_enforcement_ns := time.parse_rfc3339_ns(expected_enforcement_str)
+    # 60 days from creation
+    enforcement_ns := add_days_ns(creation_ns, 60)
+    expected_enforcement_date := format_ns_to_rfc3339(enforcement_ns)
 
     input_data := {
-        "repoCreationDate": creation,
+        "repoCreationDate": creation_str,
         "repoUrl": "dummy_repo",
         "pipelineAppType": "application",
         "pipelineFlavor": "flavorA",
     }
 
-    net_new := scope.is_repo_net_new
-        with input as input_data
+    net_new := scope.is_repo_net_new with input as input_data
+    fully_enforced := scope.is_repo_fully_enforced 
+        with input as input_data 
+        with scope.current_time_ns as enforcement_ns
+    full_due := scope.full_enforcement_Date with input as input_data
 
-    # Overriding the default current_time_ns
-    fully_enforced := scope.is_repo_fully_enforced
-        with input as input_data
-        with scope.current_time_ns as expected_enforcement_ns
-
-    full_due := scope.full_enforcement_Date
-        with input as input_data
-
+    # Check
     net_new == true
     fully_enforced == true
-    full_due == expected_enforcement_str
+    full_due == expected_enforcement_date
 }
 
 ###############################################################################
-# Test 2: Net new but fewer than 60 days -> fully_enforced == false
+# Test 2: Repo is net new but only 30 days have passed => fully_enforced == false
 ###############################################################################
 test_net_new_but_not_fully_enforced {
-    creation := "2024-04-02T00:00:00Z"
+    creation_str := "2024-04-02T00:00:00Z"
+    creation_ns := time.parse_rfc3339_ns(creation_str)
 
-    # Full enforcement date as an RFC3339 string
-    expected_enforcement_str := time.add_duration(creation, "1440h")
-    expected_enforcement_ns := time.parse_rfc3339_ns(expected_enforcement_str)
+    # 60 days from creation, for reference
+    enforcement_ns := add_days_ns(creation_ns, 60)
+    expected_enforcement_date := format_ns_to_rfc3339(enforcement_ns)
 
-    # We'll simulate that only 30 days have passed:
-    partial_duration_str := "720h"  # 30 days
-    partial_ts_ns := time.parse_rfc3339_ns(time.add_duration(creation, partial_duration_str))
+    # We'll simulate current time is creation + 30 days
+    current_time_ns_30days := add_days_ns(creation_ns, 30)
 
     input_data := {
-        "repoCreationDate": creation,
+        "repoCreationDate": creation_str,
         "repoUrl": "dummy_repo",
         "pipelineAppType": "application",
         "pipelineFlavor": "flavorA",
     }
 
-    net_new := scope.is_repo_net_new
-        with input as input_data
-
+    net_new := scope.is_repo_net_new with input as input_data
     fully_enforced := scope.is_repo_fully_enforced
         with input as input_data
-        with scope.current_time_ns as partial_ts_ns
+        with scope.current_time_ns as current_time_ns_30days
+    full_due := scope.full_enforcement_Date with input as input_data
 
-    full_due := scope.full_enforcement_Date
-        with input as input_data
-
+    # Check
     net_new == true
     fully_enforced == false
-    full_due == expected_enforcement_str
+    full_due == expected_enforcement_date
 }
 
 ###############################################################################
-# Test 3: Not net new (creation date <= 2024-04-01) -> net_new == false
+# Test 3: Repo is NOT net new (creation date <= 2024-04-01) => net_new == false
 ###############################################################################
 test_not_net_new {
-    # Before cutoff: "2024-04-01T00:00:00Z" is the boundary; let's pick 2024-03-31
-    creation := "2024-03-31T00:00:00Z"
+    creation_str := "2024-03-31T00:00:00Z"
+    creation_ns := time.parse_rfc3339_ns(creation_str)
 
-    expected_enforcement_str := time.add_duration(creation, "1440h")
+    # 60 days from that creation
+    enforcement_ns := add_days_ns(creation_ns, 60)
+    expected_enforcement_date := format_ns_to_rfc3339(enforcement_ns)
 
-    # Even if we simulate time well past 60 days, it won't matter because it's NOT net new.
-    # We go 70 days out, for instance:
-    big_duration_str := "1680h" # 70 days
-    big_time_ns := time.parse_rfc3339_ns(time.add_duration(creation, big_duration_str))
+    # We'll simulate well past 60 days
+    current_time_ns_70days := add_days_ns(creation_ns, 70)
 
     input_data := {
-        "repoCreationDate": creation,
+        "repoCreationDate": creation_str,
         "repoUrl": "dummy_repo",
         "pipelineAppType": "application",
         "pipelineFlavor": "flavorA",
     }
 
-    net_new := scope.is_repo_net_new
-        with input as input_data
-
+    net_new := scope.is_repo_net_new with input as input_data
     fully_enforced := scope.is_repo_fully_enforced
         with input as input_data
-        with scope.current_time_ns as big_time_ns
+        with scope.current_time_ns as current_time_ns_70days
+    full_due := scope.full_enforcement_Date with input as input_data
 
-    full_due := scope.full_enforcement_Date
-        with input as input_data
-
+    # Check
     net_new == false
     fully_enforced == false
-    full_due == expected_enforcement_str
+    full_due == expected_enforcement_date
 }
+
