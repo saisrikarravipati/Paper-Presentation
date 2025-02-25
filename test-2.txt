@@ -13,59 +13,54 @@ IN_SCOPE_CUTOFF_DATE := "2024-05-15T00:00:00Z"
 # New logic for repo net-new and full enforcement
 # ---------------------------------------------------------------------
 
-# Define the cutoff for a repo to be considered "net new".
+# Define the cutoff for a repo to be considered "net new"
 net_new_cutoff_ns := time.parse_rfc3339_ns("2024-04-01T00:00:00Z")
 
 # Calculate 60 days in nanoseconds:
 # 60 days * 24 hours * 60 minutes * 60 seconds * 1e9 nanoseconds
 sixty_days_ns := 60 * 24 * 60 * 60 * 1000000000
 
-# Parse the repoCreationDate. First, try a custom format; if that fails, use RFC3339.
+# Parse the repoCreationDate. First try a custom format, otherwise use RFC3339.
 repo_creation_timestamp := parsed_timestamp {
     parsed_timestamp := time.parse_ns("2006-01-02T15:04:05", input.repoCreationDate)
 } else {
     time.parse_rfc3339_ns(input.repoCreationDate)
 }
 
-# Calculate the full enforcement timestamp by adding 60 days to repo creation.
+# Calculate the full enforcement timestamp (raw nanoseconds).
 full_enforcement_ns := repo_creation_timestamp + sixty_days_ns
 
-# Because OPA 0.59.0 lacks formatting functions, we output the raw timestamp.
-# Consumers of this policy can format full_enforcement_ns externally if needed.
+# Since OPA 0.59.0 lacks a built-in formatter, we output the raw timestamp.
 full_enforcement_Date := full_enforcement_ns
 
-# A repo is considered "net new" if its creation timestamp is after the net-new cutoff.
+# Determine if the repo is "net new"
 is_repo_net_new := repo_creation_timestamp > net_new_cutoff_ns
 
 # ---------------------------------------------------------------------
-# Determine current time
+# Determine the current time
 # ---------------------------------------------------------------------
-# Since inline if/else or ternary operators are not available, we use multiple rule bodies.
-# We allow an override via input.test_now for testability; otherwise, we use time.now_ns().
-
-current_time_ns = t {
-    input.test_now
-    t = input.test_now
+# Use an override from data.test_current_time_ns if it exists.
+current_time_ns() = t {
+    t = data.test_current_time_ns
 }
-current_time_ns = t {
-    not input.test_now
-    t = time.now_ns()
+current_time_ns() = time.now_ns() {
+    not data.test_current_time_ns
 }
 
 # ---------------------------------------------------------------------
 # Define a function to check if the repo is fully enforced.
 # A repo is fully enforced if it is net new and at least 60 days have passed.
-# We use multiple rule bodies to avoid inline "and" expressions.
+# Multiple rule bodies are used to avoid inline compound expressions.
 is_repo_fully_enforced() = true {
     is_repo_net_new
-    current_time_ns >= full_enforcement_ns
+    current_time_ns() >= full_enforcement_ns
 }
 is_repo_fully_enforced() = false {
     not is_repo_net_new
 }
 is_repo_fully_enforced() = false {
     is_repo_net_new
-    current_time_ns < full_enforcement_ns
+    current_time_ns() < full_enforcement_ns
 }
 
 # ---------------------------------------------------------------------
@@ -73,21 +68,15 @@ is_repo_fully_enforced() = false {
 # ---------------------------------------------------------------------
 
 results := response {
-    all_decisions := [d |
-        some res in scope_results
-        d := res.decision
-    ]
-    all_messages := [m |
-        some res in scope_results
-        m := res.message
-    ]
+    all_decisions := [d | some res in scope_results; d := res.decision]
+    all_messages := [m | some res in scope_results; m := res.message]
     decision := make_decision(all_decisions)
     response := {
         "policy_name": "Enforcement Scope policy",
         "decision": decision,
         "messages": all_messages,
         "isRepoInEtbScope": ETBinScope,
-        # --- New fields added below ---
+        # --- New fields below ---
         "is_repo_net_new": is_repo_net_new,
         "is_repo_fully_enforced": is_repo_fully_enforced(),
         "full_enforcement_Date": full_enforcement_Date,
@@ -145,7 +134,6 @@ scope_results contains decision {
 ETBinScope {
     lower(input.repoUrl) in data.ETB_list
 }
-
 ETBinScope {
     false
 }
@@ -184,8 +172,7 @@ make_decision(decisions) = result {
 
 
 
-
--------------------------------------
+---------------------------------
 
 
 
@@ -199,14 +186,19 @@ test_repo_before_net_new {
         "repoCreationDate": "2024-03-01T00:00:00Z",
         "repoUrl": "example.com",
         "pipelineAppType": "application",
-        "pipelineFlavor": "scope_flavor",
-        "test_now": time.parse_rfc3339_ns("2024-03-15T00:00:00Z")
+        "pipelineFlavor": "scope_flavor"
     }
     result := scope.results with input as input
+                               with data.test_current_time_ns as time.parse_rfc3339_ns("2024-03-15T00:00:00Z")
+
+    trace("Test 1 - Result", result)
+    trace("Test 1 - Input", input)
+
     result.is_repo_net_new == false
     result.is_repo_fully_enforced == false
 
     expected_full_enf := time.parse_rfc3339_ns("2024-03-01T00:00:00Z") + (60 * 24 * 60 * 60 * 1000000000)
+    trace("Test 1 - Expected enforcement timestamp", expected_full_enf)
     result.full_enforcement_Date == expected_full_enf
 }
 
@@ -215,14 +207,19 @@ test_repo_net_new_not_fully_enforced {
         "repoCreationDate": "2024-04-15T00:00:00Z",
         "repoUrl": "example.com",
         "pipelineAppType": "application",
-        "pipelineFlavor": "scope_flavor",
-        "test_now": time.parse_rfc3339_ns("2024-05-10T00:00:00Z")  # Less than 60 days after creation.
+        "pipelineFlavor": "scope_flavor"
     }
     result := scope.results with input as input
+                               with data.test_current_time_ns as time.parse_rfc3339_ns("2024-05-10T00:00:00Z")
+
+    trace("Test 2 - Result", result)
+    trace("Test 2 - Input", input)
+
     result.is_repo_net_new == true
     result.is_repo_fully_enforced == false
 
     expected_full_enf := time.parse_rfc3339_ns("2024-04-15T00:00:00Z") + (60 * 24 * 60 * 60 * 1000000000)
+    trace("Test 2 - Expected enforcement timestamp", expected_full_enf)
     result.full_enforcement_Date == expected_full_enf
 }
 
@@ -231,14 +228,18 @@ test_repo_fully_enforced {
         "repoCreationDate": "2024-04-15T00:00:00Z",
         "repoUrl": "example.com",
         "pipelineAppType": "application",
-        "pipelineFlavor": "scope_flavor",
-        "test_now": time.parse_rfc3339_ns("2024-07-01T00:00:00Z")  # More than 60 days after creation.
+        "pipelineFlavor": "scope_flavor"
     }
     result := scope.results with input as input
+                               with data.test_current_time_ns as time.parse_rfc3339_ns("2024-07-01T00:00:00Z")
+
+    trace("Test 3 - Result", result)
+    trace("Test 3 - Input", input)
+
     result.is_repo_net_new == true
     result.is_repo_fully_enforced == true
 
     expected_full_enf := time.parse_rfc3339_ns("2024-04-15T00:00:00Z") + (60 * 24 * 60 * 60 * 1000000000)
+    trace("Test 3 - Expected enforcement timestamp", expected_full_enf)
     result.full_enforcement_Date == expected_full_enf
 }
-
