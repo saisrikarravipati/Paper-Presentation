@@ -1,1 +1,93 @@
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+def format_repo_url(repo_url: str, pipeline_id: str) -> str:
+    """
+    Format the provided repo_url into a standardized form:
+    `https://github.cloud.capitalone.com/<org>/<repo>[... any extra segments ...]`
+    
+    This follows the original index-based logic, but preserves all segments after the
+    recognized `org` index. It also removes any `.git` from the final segment.
+    
+    If it cannot parse the URL correctly, it logs a warning and falls back to None segments.
+    """
+    parts = repo_url.split("/")
+    
+    if "api" in parts:
+        # ORIGINAL LOGIC for "api" case:
+        #   org = parts[6] if len(parts) > 6 else None
+        #   repo = parts[7] if len(parts) > 7 else None
+        #
+        # ENHANCEMENT: keep *all* segments from index 6 onward
+        # so that e.g. ["org","repo","more","stuff"] are all included
+        org_repo_segments = parts[6:] if len(parts) > 6 else []
+    else:
+        # ORIGINAL LOGIC for non-"api" case:
+        #   org = parts[3] if len(parts) > 3 else None
+        #   repo = parts[4] if len(parts) > 4 else None
+        #
+        # ENHANCEMENT: keep *all* segments from index 3 onward
+        org_repo_segments = parts[3:] if len(parts) > 3 else []
+    
+    if not org_repo_segments:
+        # means we don't have enough segments to form an org or repo
+        logger.warning(
+            f"Pipeline {pipeline_id}: unable to format repo URL. "
+            f"Input: {repo_url}"
+        )
+        return "https://github.cloud.capitalone.com/None/None"
+    
+    # Remove `.git` if it appears at the end of the last segment
+    if org_repo_segments[-1].endswith(".git"):
+        org_repo_segments[-1] = org_repo_segments[-1][:-4]  # remove '.git'
+    
+    # Join all segments into one path
+    final_path = "/".join(org_repo_segments) if org_repo_segments else "None/None"
+    
+    # If we ended up with something incomplete (like "org" only), log a warning
+    # (Optional check)
+    if len(org_repo_segments) < 2:
+        logger.warning(
+            f"Pipeline {pipeline_id}: incomplete path segments, might be missing a repo. "
+            f"Input: {repo_url}"
+        )
+    
+    return f"https://github.cloud.capitalone.com/{final_path}"
+
+
+
+
+-------------------------------------------------
+
+
+
+def test_api_url_with_extra_segments():
+    # old logic but now must keep /more/stuff
+    repo_url = "https://github.cloud.capitalone.com/api/v3/repos/org/repo/more/stuff"
+    expected_output = "https://github.cloud.capitalone.com/org/repo/more/stuff"
+    assert format_repo_url(repo_url, "pipeline_id") == expected_output
+
+def test_api_url_standard_two_segment():
+    repo_url = "https://github.cloud.capitalone.com/api/v3/repos/myorg/myrepo"
+    # Should come out to /myorg/myrepo
+    expected_output = "https://github.cloud.capitalone.com/myorg/myrepo"
+    assert format_repo_url(repo_url, "pipeline_id") == expected_output
+
+def test_non_api_url_extra_segments():
+    repo_url = "https://github.cloud.capitalone.com/moonshot/capital-one-canada-ios/extra/segment"
+    expected_output = "https://github.cloud.capitalone.com/moonshot/capital-one-canada-ios/extra/segment"
+    assert format_repo_url(repo_url, "pipeline_id") == expected_output
+
+def test_trailing_git():
+    repo_url = "https://github.cloud.capitalone.com/moonshot/wallet.git"
+    expected_output = "https://github.cloud.capitalone.com/moonshot/wallet"
+    assert format_repo_url(repo_url, "pipeline_id") == expected_output
+
+def test_not_enough_segments():
+    # Not enough parts to form org + repo
+    repo_url = "bad url"
+    # Should log a warning and produce None/None
+    expected_output = "https://github.cloud.capitalone.com/None/None"
+    assert format_repo_url(repo_url, "pipeline_id") == expected_output
