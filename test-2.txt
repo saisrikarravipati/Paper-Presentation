@@ -1,1 +1,88 @@
+###############################################################################
+# 1) Use your internal base image. 
+#    If you actually need Python 3.12, request or create a 3.12-based image.
+###############################################################################
+FROM artifactory-edge-staging.cloud.capitalone.com/baenterprisesharedimages-docker/3.11-ubuntu22-1
+
+###############################################################################
+# 2) Expose any needed ports (yours is 4222).
+###############################################################################
+EXPOSE 4222
+
+###############################################################################
+# 3) Install packages:
+#    - ca-certificates and curl for SSL/trust and downloading the cert bundle
+#    - libpq-dev, gcc, librdkafka-dev, python3-dev, python3-pip 
+#      as per your original requirements
+###############################################################################
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libpq-dev \
+    gcc \
+    librdkafka-dev \
+    python3-dev \
+    python3-pip \
+  && rm -rf /var/lib/apt/lists/*
+
+###############################################################################
+# 4) Install pipenv and virtualenv (from your original Dockerfile).
+###############################################################################
+RUN python -m pip install pipenv virtualenv
+
+###############################################################################
+# 5) Download the c1-certifi certificate bundle via curl.
+#    - We place it in /app for clarity.
+#    - We add 'chmod 644' so it’s world-readable (Python just needs read access).
+###############################################################################
+RUN set -ex && \
+    mkdir -p /app && \
+    curl --silent -o /app/c1-certifi.pem \
+        "https://github-pages.cloud.capitalone.com/python/c1-certifi/c1-certifi/systemcertificates.pem" && \
+    chmod 644 /app/c1-certifi.pem
+
+###############################################################################
+# 6) Set ENV variables so Python and 'requests' will use /app/c1-certifi.pem.
+###############################################################################
+ENV SSL_CERT_FILE=/app/c1-certifi.pem
+ENV REQUESTS_CA_BUNDLE=/app/c1-certifi.pem
+
+###############################################################################
+# 7) Add your source code into /app.
+###############################################################################
+ADD . /app
+WORKDIR /app
+
+###############################################################################
+# 8) Copy scripts (launch.sh, entry.py, secrets.yaml), 
+#    ensuring correct ownership and permissions.
+###############################################################################
+COPY --chown=appuser:appuser --chmod=755 launch.sh /app
+COPY --chown=appuser:appuser --chmod=755 entry.py /app
+COPY --chown=appuser:appuser --chmod=755 secrets.yaml /app
+
+###############################################################################
+# 9) If you have Sealights tokens or other files, copy them too.
+###############################################################################
+COPY ["sltoken*", "buildSessionId", "./"]
+
+###############################################################################
+# 10) Switch to the non-root user 'appuser'.
+###############################################################################
+USER appuser
+
+###############################################################################
+# 11) Create a virtual environment named 'venvd' (per your original Dockerfile).
+###############################################################################
+RUN python -m venv venvd --without-pip
+
+###############################################################################
+# 12) Activate that venv and install dependencies with pipenv.
+###############################################################################
+RUN /app/venvd/bin/activate && pipenv install .
+
+###############################################################################
+# 13) Default command to run your script.
+###############################################################################
+CMD ["sh", "/app/launch.sh"]
 
