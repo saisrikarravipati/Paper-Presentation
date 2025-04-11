@@ -1,1 +1,105 @@
 
+###############################################################################
+# 1) Start FROM your internal base image (Python 3.11 + Ubuntu 22). 
+#    If you truly need Python 3.12 inside the container, 
+#    you'd request or create a 3.12-based base image. 
+###############################################################################
+FROM artifactory-edge-staging.cloud.capitalone.com/baenterprisesharedimages-docker/3.11-ubuntu22-1
+
+###############################################################################
+# 2) Expose port 4222 (existing step). 
+#    This is presumably where your service listens for incoming connections.
+###############################################################################
+EXPOSE 4222
+
+###############################################################################
+# 3) Update the package manager and install necessary system packages:
+#    - ca-certificates: standard certificate store for Ubuntu
+#    - curl: needed to download the c1-certifi bundle
+#    - libpq-dev, gcc, librdkafka-dev, python3-dev, python3-pip: 
+#      from your original Dockerfile for building Python packages (psycopg2, confluent-kafka, etc.)
+###############################################################################
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libpq-dev \
+    gcc \
+    librdkafka-dev \
+    python3-dev \
+    python3-pip \
+  && rm -rf /var/lib/apt/lists/*
+
+###############################################################################
+# 4) Install pipenv and virtualenv. 
+#    Matches your original Dockerfile step. 
+###############################################################################
+RUN python -m pip install pipenv virtualenv
+
+###############################################################################
+# 5) Download and store the c1-certifi bundle that includes your internal CA(s).
+#    The snippet you have checks if file is present, but in Docker build, 
+#    we typically just download it. If the remote location changes, 
+#    you can keep or remove the conditional check.
+###############################################################################
+RUN set -ex && \
+    curl --silent -o /home/c1-certifi.pem \
+        "https://github-pages.cloud.capitalone.com/python/c1-certifi/c1-certifi/systemcertificates.pem"
+
+###############################################################################
+# 6) Set the environment variables so Python's built-in ssl and the 'requests' 
+#    library automatically trust the c1-certifi.pem. 
+#    - SSL_CERT_FILE is used by Python's SSL modules
+#    - REQUESTS_CA_BUNDLE is used by the 'requests' library 
+###############################################################################
+ENV SSL_CERT_FILE=/home/c1-certifi.pem
+ENV REQUESTS_CA_BUNDLE=/home/c1-certifi.pem
+
+###############################################################################
+# 7) Add your source code into /app. 
+#    This was in your original Dockerfile. 
+#    It copies everything from your local build context to the container.
+###############################################################################
+ADD . /app
+
+###############################################################################
+# 8) Switch to the /app directory so subsequent commands run there by default.
+###############################################################################
+WORKDIR /app
+
+###############################################################################
+# 9) Copy scripts and other files (launch.sh, entry.py, secrets.yaml), 
+#    with correct ownership (appuser) and permissions (755).
+###############################################################################
+COPY --chown=appuser:appuser --chmod=755 launch.sh /app
+COPY --chown=appuser:appuser --chmod=755 entry.py /app
+COPY --chown=appuser:appuser --chmod=755 secrets.yaml /app
+
+###############################################################################
+# 10) (Optional) Copy any additional Sealights tokens or files, 
+#     as in your original Dockerfile. If you have them in your repo, 
+#     you can keep them. Otherwise you can remove or adjust this line.
+###############################################################################
+COPY ["sltoken*", "buildSessionId", "./"]
+
+###############################################################################
+# 11) Switch to the non-root user 'appuser' (from your base image).
+###############################################################################
+USER appuser
+
+###############################################################################
+# 12) Create a virtual environment named 'venvd' without pip. 
+#     Matches your original Dockerfile instruction.
+###############################################################################
+RUN python -m venv venvd --without-pip
+
+###############################################################################
+# 13) Activate the venv and run pipenv install. 
+#     This installs all dependencies from your Pipfile/Pipfile.lock.
+###############################################################################
+RUN /app/venvd/bin/activate && pipenv install .
+
+###############################################################################
+# 14) Set the container’s default command to launch your app. 
+#     The 'launch.sh' script is presumably your main entry point.
+###############################################################################
+CMD ["sh", "/app/launch.sh"]
