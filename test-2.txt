@@ -1,1 +1,104 @@
 
+
+
+#!/usr/bin/env python3
+import os, json, time, uuid
+import boto3
+from datetime import datetime
+
+def generate_mock_messages(template, count):
+    """
+    Clone the template `count` times, replacing any 'PLACEHOLDER' with
+    unique values (UUIDs or timestamps).
+    """
+    msgs = []
+    for i in range(count):
+        m = {}
+        for k, v in template.items():
+            if v == "PLACEHOLDER":
+                # if key name contains 'id', use a UUID; if 'timestamp', use ISO timestamp
+                if "id" in k.lower():
+                    m[k] = str(uuid.uuid4())
+                elif "timestamp" in k.lower():
+                    m[k] = datetime.utcnow().isoformat() + "Z"
+                else:
+                    m[k] = str(uuid.uuid4())
+            else:
+                m[k] = v
+        msgs.append(m)
+    return msgs
+
+def write_messages_to_file(msgs, filename):
+    with open(filename, "w") as f:
+        json.dump(msgs, f, indent=2)
+    print(f"→ Wrote {len(msgs)} messages to {filename}")
+
+def send_messages(sqs, queue_url, msgs, batch_size, rate):
+    send_times = []
+    total = len(msgs)
+    for i in range(0, total, batch_size):
+        batch = msgs[i : i + batch_size]
+        entries = [
+            {"Id": str(idx), "MessageBody": json.dumps(body)}
+            for idx, body in enumerate(batch)
+        ]
+        t0 = time.monotonic()
+        resp = sqs.send_message_batch(QueueUrl=queue_url, Entries=entries)
+        t1 = time.monotonic()
+        # record avg send time per msg (ms)
+        send_times.append((t1 - t0)*1_000/len(entries))
+
+        if resp.get("Failed"):
+            print(f"!! Failed entries for batch {i//batch_size}: {resp['Failed']}")
+
+        if rate > 0:
+            # throttle to 'rate' msgs/sec
+            desired = len(entries) / rate
+            actual  = time.monotonic() - t1
+            if desired > actual:
+                time.sleep(desired - actual)
+
+    avg = sum(send_times) / len(send_times)
+    print(f"→ Sent {total} msgs to {queue_url} in {len(send_times)} batches; avg send-latency {avg:.2f} ms/msg\n")
+
+def main():
+    # 1) read AWS region + config path
+    region   = os.getenv("AWS_REGION", "us-west-2")
+    cfg_path = os.getenv("QUEUE_CONFIG_PATH", "queue_config.json")
+
+    # 2) load the queue definitions
+    with open(cfg_path) as cf:
+        config = json.load(cf)
+
+    # 3) pre-generate ALL mock data first
+    all_messages = {}
+    for q in config["queues"]:
+        name       = q["name"]
+        tmpl_file  = q["template_file"]
+        count      = q["message_count"]
+
+        template = json.load(open(tmpl_file))
+        msgs     = generate_mock_messages(template, count)
+        sample_file = f"sample_messages_{name}.json"
+        write_messages_to_file(msgs, sample_file)
+        all_messages[name] = {
+            "queue_url":   q["queue_url"],
+            "messages":    msgs,
+            "message_rate": q.get("message_rate", 0)
+        }
+
+    # 4) now open SQS client and publish
+    sqs = boto3.client("sqs", region_name=region)
+    for name, info in all_messages.items():
+        print(f"=== Publishing to queue '{name}' ===")
+        send_messages(
+            sqs,
+            info["queue_url"],
+            info["messages"],
+            batch_size=10,
+            rate=info["message_rate"]
+        )
+
+if __name__ == "__main__":
+    main()
+
