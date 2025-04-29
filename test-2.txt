@@ -6,13 +6,28 @@ WITH first50 AS (
 ),
 bounds AS (
   SELECT
-    MIN(created_date)        AS first_ts,
-    MAX(created_date)        AS last_ts,
-    COUNT(*)                 AS cnt
+    MIN(created_date)         AS first_msg_ts,
+    MAX(created_date)         AS last_msg_ts,
+    COUNT(*)                  AS total_messages
   FROM first50
 )
 SELECT
-  -- average interval in seconds between first and last over the (cnt−1) intervals
-  EXTRACT(EPOCH FROM (last_ts - first_ts)) / (cnt - 1) AS avg_processing_seconds,
-  (last_ts - first_ts) / (cnt - 1)                      AS avg_processing_interval
+  first_msg_ts,
+  last_msg_ts,
+  total_messages,
+  -- Average gap in seconds:
+  EXTRACT(
+    EPOCH 
+    FROM (last_msg_ts - first_msg_ts)
+  ) / (total_messages - 1) 
+    AS avg_interval_seconds,
+  -- Average gap in milliseconds:
+  EXTRACT(
+    EPOCH 
+    FROM (last_msg_ts - first_msg_ts)
+  ) * 1000 / (total_messages - 1) 
+    AS avg_interval_ms,
+  -- Average gap as an INTERVAL type:
+  (last_msg_ts - first_msg_ts) / (total_messages - 1) 
+    AS avg_interval_interval
 FROM bounds;
