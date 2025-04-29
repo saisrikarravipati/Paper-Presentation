@@ -1,1 +1,190 @@
+### `templates/queue_config.json`
+```json
+{
+  "queues": [
+    {
+      "name": "jira_test",
+      "template_file": "jira_test.json",
+      "message_count": 50,
+      "message_rate": 5,
+      "stream_config": {
+        "SDP_BA": "BAJIRA",
+        "SDP_UPSTREAM_ENV": "QA-US-EAST-1",
+        "client_id": "YOUR_CLIENT_ID",
+        "client_secret": "YOUR_CLIENT_SECRET",
+        "api_major_version": 1,
+        "max_retries": 5,
+        "retry_delay_seconds": 5,
+        "schema_name": "internal_operation_test_case_management_copy",
+        "base_url": "https://api-sdp-it.cloud.capitalone.com"
+      }
+    },
+    {
+      "name": "sevenps_test",
+      "template_file": "sevenps_test.json",
+      "message_count": 50,
+      "message_rate": 5,
+      "stream_config": {
+        "SDP_BA": "BA7PSTESTPLATFORM",
+        "SDP_UPSTREAM_ENV": "QA-US-EAST-1",
+        "client_id": "YOUR_CLIENT_ID",
+        "client_secret": "YOUR_CLIENT_SECRET",
+        "api_major_version": 1,
+        "max_retries": 5,
+        "retry_delay_seconds": 5,
+        "schema_name": "enterprise_test_report_aggregates",
+        "base_url": "https://api-sdp-it.cloud.capitalone.com"
+      }
+    },
+    {
+      "name": "unit_test",
+      "template_file": "unit_test.json",
+      "message_count": 50,
+      "message_rate": 5,
+      "stream_config": {
+        "SDP_BA": "BATESTINGINSIGHTSPLATFORM",
+        "SDP_UPSTREAM_ENV": "QA-US-EAST-1",
+        "client_id": "YOUR_CLIENT_ID",
+        "client_secret": "YOUR_CLIENT_SECRET",
+        "api_major_version": 1,
+        "max_retries": 5,
+        "retry_delay_seconds": 5,
+        "schema_name": "enterprise_testing_insights_unit_test_results_data_v5",
+        "base_url": "https://api-sdp-it.cloud.capitalone.com"
+      }
+    }
+  ]
+}
+```
+
+---
+
+### `publish_multi_load.py`
+```python
+#!/usr/bin/env python3
+import os
+import json
+import time
+import uuid
+import copy
+from datetime import datetime
+import onestream_client
+
+# Determine script & templates directory
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATES_DIR = os.path.join(SCRIPT_DIR, "templates")
+
+
+def replace_placeholders(obj):
+    """
+    Recursively replace any string == "PLACEHOLDER" with a unique value:
+    - Keys containing 'timestamp' → ISO8601 UTC timestamp
+    - Otherwise → UUID
+    """
+    if isinstance(obj, dict):
+        new = {}
+        for k, v in obj.items():
+            if v == "PLACEHOLDER":
+                key_lc = k.lower()
+                if "timestamp" in key_lc:
+                    new[k] = datetime.utcnow().isoformat() + "Z"
+                else:
+                    new[k] = str(uuid.uuid4())
+            else:
+                new[k] = replace_placeholders(v)
+        return new
+    elif isinstance(obj, list):
+        return [replace_placeholders(item) for item in obj]
+    else:
+        return obj
+
+
+def generate_mock_messages(template_data, count):
+    """
+    Generate `count` messages from template_data (dict or list of dicts).
+    """
+    templates = template_data if isinstance(template_data, list) else [template_data]
+    msgs = []
+    for i in range(count):
+        base = templates[i % len(templates)]
+        msg = replace_placeholders(copy.deepcopy(base))
+        msgs.append(msg)
+    return msgs
+
+
+def write_messages_to_file(msgs, filename):
+    """Write the messages list to a JSON file."""
+    with open(filename, "w") as f:
+        json.dump(msgs, f, indent=2)
+    print(f"→ Wrote {len(msgs)} messages to {filename}")
+
+
+def send_messages(msgs, rate, stream_cfg):
+    """
+    Publish messages via OnestreamClient.publish_record(), throttled to `rate` msgs/sec.
+    """
+    # Patch in the correct config for this stream
+    onestream_client.config = stream_cfg
+    client = onestream_client.OnestreamClient()
+    client.init_()
+
+    send_times = []
+    total = len(msgs)
+    batch_size = 10
+
+    for i in range(0, total, batch_size):
+        batch = msgs[i : i + batch_size]
+        t0 = time.monotonic()
+        resp = client.publish_record(batch)
+        t1 = time.monotonic()
+
+        dur_per_msg = (t1 - t0) * 1_000 / len(batch)
+        send_times.append(dur_per_msg)
+
+        if resp.status_code != 200:
+            print(f"!! publish_record returned {resp.status_code}: {resp.text}")
+
+        # Throttle to `rate` messages/sec
+        if rate > 0:
+            desired = len(batch) / rate
+            actual  = time.monotonic() - t1
+            if desired > actual:
+                time.sleep(desired - actual)
+
+    avg = sum(send_times) / len(send_times) if send_times else 0
+    print(f"→ Published {total} msgs; avg latency {avg:.2f} ms/msg")
+
+
+def main():
+    # Load queue configuration
+    config_path = os.path.join(TEMPLATES_DIR, "queue_config.json")
+    with open(config_path) as cf:
+        cfg = json.load(cf)
+
+    # Pre-generate all messages
+    all_messages = {}
+    for q in cfg["queues"]:
+        name       = q["name"]
+        tmpl_file  = os.path.join(TEMPLATES_DIR, q["template_file"])
+        count      = q["message_count"]
+        rate       = q["message_rate"]
+        stream_cfg = q["stream_config"]
+
+        with open(tmpl_file) as tf:
+            template_data = json.load(tf)
+
+        msgs = generate_mock_messages(template_data, count)
+        write_messages_to_file(msgs, f"sample_messages_{name}.json")
+        all_messages[name] = {"messages": msgs, "rate": rate, "stream_cfg": stream_cfg}
+
+    # Publish for each stream
+    for name, info in all_messages.items():
+        print(f"=== Publishing to stream '{name}' at {info['rate']} TPS ===")
+        send_messages(info["messages"], info["rate"], info["stream_cfg"])
+
+
+if __name__ == "__main__":
+    main()
+```
+
 
