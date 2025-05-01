@@ -1,1 +1,16 @@
 
+import json, logging
+
+logger = logging.getLogger(__name__)
+
+start_processing = time.time()
+# … your format & DB insert …
+duration = time.time() - start_processing
+
+# emit a single JSON log line
+logger.info(json.dumps({
+    "event": "message_processed",
+    "message_processing_time": round(duration, 3),
+    "service": "sevenps_test",
+    "env": "staging"
+}))
