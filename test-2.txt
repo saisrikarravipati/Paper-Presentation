@@ -1,18 +1,1 @@
-import httpx
-import logging
 
-logger = logging.getLogger(__name__)
-
-async def get_utep_details(request_body: dict) -> dict:
-    ba = request_body.get("businessApplication", "")
-    params = {
-        "query": f"{UTEP_QUERY_PARAMS}{ba}",
-        "fields": "unifiedExceptionSecondLevelSubtype, unifiedExceptionDisplayId",
-    }
-    url = f"{EXCHANGE_UTEP_PATH}/v1"       # tweak if versioning lives elsewhere
-
-    async with httpx.AsyncClient(timeout=10.0, verify=False) as client:   # SSL checks OFF
-        logger.info("Calling Service‑Now API directly (verify=False)")
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()       # raises on 4xx/5xx
-        return resp.json()
