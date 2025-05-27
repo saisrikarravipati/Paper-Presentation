@@ -1,1 +1,42 @@
+import os
+import psycopg
+from psycopg import OperationalError
+
+class DatabaseConnectionError(Exception):
+    pass
+
+def before_scenario(context, scenario):
+    if "database" not in scenario.effective_tags:
+        return
+
+    host = (
+        "testing-insights-db-batestinginsightsplatform-dev.clouddqt.capitalone.com"
+        if os.getenv("test_environment") == "DEV"
+        else "testing-insights-db-batestinginsightsplatform-qa.clouddqt.capitalone.com"
+    )
+    user = os.getenv("_7PS_DB_APP_USERNAME")
+    pwd  = os.getenv("_7PS_DB_APP_PASSWORD")
+    dbname = "testinginsightsdb"
+    port = 5432
+
+    try:
+        context.connection = psycopg.connect(
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=pwd,
+            timeout=5,           # fail fast
+            connect_timeout=5,   # alias for timeout
+        )
+    except OperationalError as err:
+        # print everything so you can see what's wrong
+        print("DB connect failed with:")
+        print(f"  host={host!r}")
+        print(f"  port={port!r}")
+        print(f"  dbname={dbname!r}")
+        print(f"  user={user!r}")
+        print(f"  pwd={'<set>' if pwd else '<empty>'}")
+        print(f"  err={err!r}")
+        raise DatabaseConnectionError("Unable to connect to DB") from err
 
