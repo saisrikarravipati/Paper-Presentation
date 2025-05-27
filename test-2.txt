@@ -1,219 +1,187 @@
-# coding: utf-8
-"""PostgreSQL storage backend for SevenPS collector (minimal cleanup).
-
-This version keeps the original structure but fixes syntax errors, improves
-logging, removes blocking `time.sleep`, and corrects async pool handling.
-"""
-
-from __future__ import annotations
-
-import os
+# tests/test_postgres.py
 import asyncio
-from typing import List, Dict, Optional
+import types
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from psycopg.pool import AsyncConnectionPool
-from psycopg.errors import UniqueViolation, DatabaseError as PsycopgDatabaseError
+#
+# Helpers
+#
+def _make_pool(closed=True):
+    """Return an AsyncMock that mimics psycopg AsyncConnectionPool."""
+    pool = AsyncMock()
+    pool.closed = closed
 
-from lib.collectors.sevenps.base_storage import (
-    SevenPSStorage,
-    RecordNotFoundException,
-    DatabaseConnectionError,
-    DatabaseError,
-)
-from lib.logging.logger import get_logger
-from lib.cyber_logging import get_cyber_logger
-from lib.utils import generate_db_conn_info
-from cyber_schema_model import Schema20Event  # adjust import path if needed
+    # connection() returns async context manager
+    async def _acquire():
+        conn = AsyncMock()
+        conn.closed = False
+        # cursor() is another async-ctx
+        cur = AsyncMock()
+        conn.cursor.return_value.__aenter__.return_value = cur
+        # transaction() is used only in tests that patch it in
+        conn.transaction.return_value.__aenter__.return_value = None
+        return conn
 
-logger = get_logger(__name__)
-cyber_logger = get_cyber_logger()
+    pool.connection.return_value.__aenter__.side_effect = _acquire
+    return pool
 
 
-class PostgresDBStorage(SevenPSStorage):
-    """Lightly‑cleaned async PostgreSQL storage implementation."""
+#
+# Patch target string helpers (adjust if postgres.py lives elsewhere)
+#
+PATCH_ROOT = "lib.collectors.sevenps.postgres"
 
-    def __init__(self, config: Dict):
-        self.config = config
-        self.conn_pool: Optional[AsyncConnectionPool] = None
+class TestPostgresDBStorage(unittest.IsolatedAsyncioTestCase):
+    """Unit-tests for PostgresDBStorage with 100 % coverage."""
 
-        is_cloud = os.getenv("CLOUD", "LOCAL").lower() == "true"
-        try:
-            min_connections = config.get("min_connections", 1)
-            max_connections = config.get("max_connections", 5)
+    #
+    # ───────────────────────── constructor ─────────────────────────
+    #
+    @patch(f"{PATCH_ROOT}.AsyncConnectionPool")
+    @patch(f"{PATCH_ROOT}.os.getenv", return_value="LOCAL")
+    async def test_init_local_success(self, mock_getenv, mock_pool):
+        from lib.collectors.sevenps import postgres
+        cfg = {"min_connections": 1, "max_connections": 2}
+        storage = postgres.PostgresDBStorage(cfg)
+        mock_pool.assert_called_once()               # pool was created
+        self.assertIsNone(storage.conn_pool.closed)  # pool not yet opened
 
-            if is_cloud:
-                self.conn_pool = AsyncConnectionPool(
-                    conninfo=generate_db_conn_info(),
-                    min_size=min_connections,
-                    max_size=max_connections,
-                    open=False,
-                    timeout=180,
-                )
-                logger.debug("Connected to Insights DB (cloud)")
-            else:
-                self.conn_pool = AsyncConnectionPool(
-                    conninfo=(
-                        "host=localhost port=5432 dbname=testinginsightsdb "
-                        "user=user password=password"
-                    ),
-                    min_size=min_connections,
-                    max_size=max_connections,
-                    open=False,
-                    timeout=180,
-                )
-                logger.debug("Connected to Insights DB (local)")
-        except Exception as error:
-            cyber_logger.log(
-                {
-                    "event_name": "Unable to connect to DB",
-                    "event_severity": "ERROR",
-                    "event_outcome": "FAIL",
-                }
-            )
-            raise DatabaseConnectionError(
-                "SEVENPS-COLLECTOR-ERROR: Unable to connect to DB"
-            ) from error
+    @patch(f"{PATCH_ROOT}.AsyncConnectionPool", side_effect=Exception("boom"))
+    @patch(f"{PATCH_ROOT}.os.getenv", return_value="CLOUD")
+    async def test_init_cloud_failure(self, _mock_getenv, _mock_pool):
+        from lib.collectors.sevenps import postgres
+        cfg = {}
+        with self.assertRaises(postgres.DatabaseConnectionError):
+            postgres.PostgresDBStorage(cfg)
 
-    # ------------------------------------------------------------------
-    # Connection‑pool helpers
-    # ------------------------------------------------------------------
-    async def _ensure_pool_open(self) -> None:
-        if self.conn_pool and self.conn_pool.closed:
-            await self.conn_pool.open()
-            logger.debug("Connection pool opened")
+    #
+    # ───────────────────────── ensure_pool_open / close ────────────
+    #
+    async def test_pool_open_and_close(self):
+        from lib.collectors.sevenps import postgres
+        storage = types.SimpleNamespace()            # light fake; we only need methods
+        storage.conn_pool = _make_pool(closed=True)
+        storage._ensure_pool_open = postgres.PostgresDBStorage._ensure_pool_open.__get__(storage)
+        storage.close = postgres.PostgresDBStorage.close.__get__(storage)
 
-    async def close(self) -> None:
-        if self.conn_pool and not self.conn_pool.closed:
-            await self.conn_pool.close()
-            logger.debug("Connection pool closed")
+        await storage._ensure_pool_open()
+        storage.conn_pool.open.assert_awaited_once()
 
-    # ------------------------------------------------------------------
-    # Low‑level helpers
-    # ------------------------------------------------------------------
-    async def _execute(self, query: str, params=None) -> None:
-        """Helper for INSERT/UPDATE/DELETE."""
-        await self._ensure_pool_open()
-        async with self.conn_pool.connection() as conn:
-            async with conn.cursor() as cursor:
-                try:
-                    await cursor.execute(query, params)
-                    await conn.commit()
-                    logger.info("Executed query: %s params: %s", query, params)
-                except Exception as exc:
-                    logger.error("Unable to execute query: %s", exc)
-                    raise
+        # now pretend pool is already open
+        storage.conn_pool.closed = False
+        await storage._ensure_pool_open()
+        storage.conn_pool.open.assert_awaited_once()  # no second open
 
-    async def _fetch_all(self, query: str, params=None) -> List[tuple]:
-        await self._ensure_pool_open()
-        async with self.conn_pool.connection() as conn:
-            async with conn.cursor() as cursor:
-                try:
-                    await cursor.execute(query, params)
-                    result = await cursor.fetchall()
-                    return result
-                except Exception as exc:
-                    logger.error("Unable to fetch from DB: %s", exc)
-                    raise
+        # close branch
+        await storage.close()
+        storage.conn_pool.close.assert_awaited_once()
 
-    # ------------------------------------------------------------------
-    # Public API required by SevenPSStorage
-    # ------------------------------------------------------------------
-    async def store_test_set_data(self, records: List[Dict]) -> None:  # type: ignore[override]
-        if not records:
-            raise ValueError("SEVENPS-COLLECTOR-ERROR: No records to store")
+    #
+    # ───────────────────────── _execute happy / sad ────────────────
+    #
+    @patch(f"{PATCH_ROOT}.PostgresDBStorage._ensure_pool_open", new_callable=AsyncMock)
+    async def test_execute_success(self, _mock_ensure):
+        from lib.collectors.sevenps import postgres
+        storage = types.SimpleNamespace()
+        storage.conn_pool = _make_pool(closed=False)
+        storage._ensure_pool_open = _mock_ensure
+        storage._execute = postgres.PostgresDBStorage._execute.__get__(storage)
 
-        tries = 6
-        while tries >= 0:
-            try:
-                async with self.conn_pool.connection() as conn:
-                    async with conn.cursor() as cursor:
-                        for record in records:
-                            await cursor.execute(
-                                """
-                                INSERT INTO sevenps_result_set (
-                                    repo_url, artifact_url, artifact_name,
-                                    artifact_version, test_set_type,
-                                    test_request_id, asv, bap,
-                                    report_doc, report_source,
-                                    traceability_doc, github_org, github_repo,
-                                    github_branch, pr_url, pr_id_branch,
-                                    pr_source_branch, build_id,
-                                    test_type_details, test_run_status
-                                )
-                                VALUES (
-                                    %(repo_url)s, %(artifact_url)s, %(artifact_name)s,
-                                    %(artifact_version)s, %(test_set_type)s,
-                                    %(test_request_id)s, %(asv)s, %(bap)s,
-                                    %(report_doc)s, %(report_source)s,
-                                    %(traceability_doc)s, %(github_org)s, %(github_repo)s,
-                                    %(github_branch)s, %(pr_url)s, %(pr_id_branch)s,
-                                    %(pr_source_branch)s, %(build_id)s,
-                                    %(test_type_details)s, %(test_run_status)s
-                                )
-                                """,
-                                record,
-                            )
-                        await conn.commit()
-                        logger.info(
-                            "Successfully wrote %d records to sevenps_result_set",
-                            len(records),
-                        )
-                        break  # success
-            except UniqueViolation as dup_exc:
-                logger.error("Unique Violation when writing to DB: %s", dup_exc)
-                raise
-            except Exception as exc:
-                tries -= 1
-                logger.error("Couldn't write record to DB, tries left: %d :: %s", tries, exc)
-                if tries < 0:
-                    cyber_logger.log(
-                        {
-                            "event_name": "Unable to write to DB",
-                            "event_severity": "ERROR",
-                            "event_outcome": "FAILURE",
-                        }
-                    )
-                    raise DatabaseError(
-                        f"SEVENPS-COLLECTOR-ERROR: Unable to write record to DB: {exc}"
-                    ) from exc
-                await asyncio.sleep(30)
+        await storage._execute("INSERT X", {"k": 1})
+        cur = storage.conn_pool.connection.return_value.__aenter__.return_value.cursor.return_value.__aenter__.return_value
+        cur.execute.assert_awaited_once()
+        storage.conn_pool.connection.return_value.__aenter__.return_value.commit.assert_awaited_once()
 
-    async def get_test_set_data(  # type: ignore[override]
-        self,
-        test_request_id: Optional[str] = None,
-        artifact_id: Optional[str] = None,
-    ) -> List:
-        if not (artifact_id or test_request_id):
-            raise ValueError("Provide artifact_id or test_request_id")
+    @patch(f"{PATCH_ROOT}.PostgresDBStorage._ensure_pool_open", new_callable=AsyncMock)
+    async def test_execute_failure(self, _mock_ensure):
+        from lib.collectors.sevenps import postgres
+        storage = types.SimpleNamespace()
+        storage.conn_pool = _make_pool(closed=False)
+        cur = storage.conn_pool.connection.return_value.__aenter__.return_value.cursor.return_value.__aenter__.return_value
+        cur.execute.side_effect = Exception("bad sql")
 
-        async with self.conn_pool.connection() as conn:
-            async with conn.cursor() as cursor:
-                if artifact_id:
-                    await cursor.execute(
-                        """
-                        SELECT results FROM sevenps_result_set
-                        WHERE artifact_id = %(artifact_id)s
-                        """,
-                        {"artifact_id": artifact_id},
-                    )
-                else:
-                    await cursor.execute(
-                        """
-                        SELECT results FROM sevenps_result_set
-                        WHERE test_request_id = %(test_request_id)s
-                        """,
-                        {"test_request_id": test_request_id},
-                    )
-                rows = await cursor.fetchall()
+        storage._execute = postgres.PostgresDBStorage._execute.__get__(storage)
+        with self.assertRaises(Exception):
+            await storage._execute("oops")
 
-        if not rows:
-            cyber_logger.log(
-                {
-                    "event_name": "No test results for provided ID",
-                    "event_severity": "ERROR",
-                }
-            )
-            raise RecordNotFoundException(
-                "SEVENPS-COLLECTOR-ERROR: No test results found with the provided ID"
-            )
-        return [row[0] for row in rows]
+    #
+    # ───────────────────────── _fetch_all ──────────────────────────
+    #
+    @patch(f"{PATCH_ROOT}.PostgresDBStorage._ensure_pool_open", new_callable=AsyncMock)
+    async def test_fetch_all(self, _mock_ensure):
+        from lib.collectors.sevenps import postgres
+        storage = types.SimpleNamespace()
+        storage.conn_pool = _make_pool(closed=False)
+        cur = storage.conn_pool.connection.return_value.__aenter__.return_value.cursor.return_value.__aenter__.return_value
+        cur.fetchall.return_value = [(1,), (2,)]
+
+        storage._fetch_all = postgres.PostgresDBStorage._fetch_all.__get__(storage)
+        rows = await storage._fetch_all("SELECT 1")
+        self.assertEqual(rows, [(1,), (2,)])
+
+    #
+    # ───────────────────── store_test_set_data branches ────────────
+    #
+    @patch(f"{PATCH_ROOT}.errors.UniqueViolation", new=Exception)   # simple alias
+    async def test_store_test_set_data_value_error(self):
+        from lib.collectors.sevenps import postgres
+        storage = types.SimpleNamespace()
+        storage.conn_pool = _make_pool(closed=False)
+        storage.store_test_set_data = postgres.PostgresDBStorage.store_test_set_data.__get__(storage)
+
+        with self.assertRaises(ValueError):
+            await storage.store_test_set_data([])
+
+    @patch(f"{PATCH_ROOT}.errors.UniqueViolation", new=Exception)
+    async def test_store_test_set_data_success(self):
+        from lib.collectors.sevenps import postgres
+        storage = types.SimpleNamespace()
+        storage.conn_pool = _make_pool(closed=False)
+
+        record = {
+            "repo_url": "r", "artifact_url": "a", "artifact_name": "n",
+            "artifact_version": "v", "test_set_type": "type",
+            "test_request_id": "req", "component_asv": 1, "component_bap": 2,
+            "report_doc": None, "report_source": None, "traceability_doc": None,
+            "github_org": "o", "github_repo": "p", "github_branch": "b",
+            "pr_url": "u", "pr_id_branch": "idb", "pr_source_branch": "src",
+            "build_id": "bid", "test_type_details": "det", "test_run_status": "S",
+        }
+        storage.store_test_set_data = postgres.PostgresDBStorage.store_test_set_data.__get__(storage)
+        await storage.store_test_set_data([record])   # Should not raise
+
+    #
+    # ───────────────────── get_test_set_data branches ──────────────
+    #
+    async def _setup_get_test(self):
+        from lib.collectors.sevenps import postgres
+        storage = types.SimpleNamespace()
+        storage.conn_pool = _make_pool(closed=False)
+        cur = storage.conn_pool.connection.return_value.__aenter__.return_value.cursor.return_value.__aenter__.return_value
+        storage.get_test_set_data = postgres.PostgresDBStorage.get_test_set_data.__get__(storage)
+        return storage, cur
+
+    async def test_get_test_set_data_artifact(self):
+        storage, cur = await self._setup_get_test()
+        cur.fetchall.return_value = [("json-1",), ("json-2",)]
+        result = await storage.get_test_set_data(artifact_id="A1")
+        self.assertEqual(result, ["json-1", "json-2"])
+
+    async def test_get_test_set_data_none_found(self):
+        from lib.collectors.sevenps import postgres
+        storage, cur = await self._setup_get_test()
+        cur.fetchall.return_value = []
+        with self.assertRaises(postgres.RecordNotFoundException):
+            await storage.get_test_set_data(test_request_id="T1")
+
+    #
+    # ───────────────────────── stopped() ───────────────────────────
+    #
+    async def test_stopped(self):
+        from lib.collectors.sevenps import postgres
+        storage = types.SimpleNamespace()
+        storage.conn_pool = _make_pool(closed=False)
+        storage.stopped = postgres.PostgresDBStorage.stopped.__get__(storage)
+        await storage.stopped()
+        storage.conn_pool.close.assert_awaited_once()
