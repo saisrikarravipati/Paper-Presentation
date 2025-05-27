@@ -1,20 +1,174 @@
-import requests
+# tests/test_postgres_storage.py
 
-def fetch_utep_data(baCINumber: str):
-    url = "https://mimeo.clouddqt.capitalone.com:443/internal-operations/deployment-pipeline-orchestration/retrieve-utep-data"
-    params = {
-        "baCINumber": baCINumber
-    }
+import os
+import time
+import asyncio
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+from psycopg import errors
 
-    try:
-        response = requests.get(url, params=params, verify=False)  # Use verify=True if certs are valid
+# Assume you fixed and imported these:
+from lib.collectors.sevenps.postgres import (
+    PostgresDBStorage,
+    DatabaseConnectionError,
+    DatabaseError,
+    RecordNotFoundException,
+)
 
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"Request failed with status code: {response.status_code}")
-            print(response.text)
-            return None
-    except requests.RequestException as e:
-        print(f"Error occurred: {e}")
-        return None
+class TestPostgresDBStorage(unittest.IsolatedAsyncioTestCase):
+
+    @patch.dict(os.environ, {"CLOUD": "LOCAL"})
+    @patch("lib.utils.generate_db_conn_info", return_value="conninfo-str")
+    @patch("psycopg_pool.AsyncConnectionPool")
+    async def test_init_local(self, mock_pool_cls, mock_gen):
+        cfg = {"min_connections": 2, "max_connections": 4}
+        inst = PostgresDBStorage(cfg)
+        # local path should pick default localhost
+        mock_pool_cls.assert_called_once()
+        self.assertIsNotNone(inst.conn_pool)
+
+    @patch.dict(os.environ, {"CLOUD": "true"})
+    @patch("lib.utils.generate_db_conn_info", return_value="cloud-info")
+    @patch("psycopg_pool.AsyncConnectionPool")
+    async def test_init_cloud(self, mock_pool_cls, mock_gen):
+        cfg = {"min_connections": 1, "max_connections": 3}
+        inst = PostgresDBStorage(cfg)
+        mock_gen.assert_called_once()
+        mock_pool_cls.assert_called_once_with(
+            conninfo="cloud-info", min_size=1, max_size=3,
+            open=False, timeout=180,
+        )
+
+    @patch.dict(os.environ, {"CLOUD": "true"})
+    @patch("lib.utils.generate_db_conn_info", side_effect=Exception("boom"))
+    async def test_init_failure(self, mock_gen):
+        with self.assertRaises(DatabaseConnectionError) as cm:
+            PostgresDBStorage({})
+        self.assertIn("Unable to connect to DB", str(cm.exception))
+
+    @patch("psycopg_pool.AsyncConnectionPool")
+    async def test_ensure_and_close(self, mock_pool_cls):
+        pool = AsyncMock()
+        pool.closed = True
+        inst = PostgresDBStorage({"min_connections":1,"max_connections":1})
+        inst.conn_pool = pool
+
+        # ensure opens when closed
+        await inst._ensure_pool_open()
+        pool.open.assert_awaited_once()
+        pool.open.reset_mock()
+
+        # no-op when already open
+        pool.closed = False
+        await inst._ensure_pool_open()
+        pool.open.assert_not_awaited()
+
+        # close only if open
+        pool.closed = False
+        await inst.close()
+        pool.close.assert_awaited_once()
+        pool.close.reset_mock()
+
+        # skip if already closed / no pool
+        pool.closed = True
+        await inst.close()
+        pool.close.assert_not_awaited()
+
+    @patch("lib.collectors.sevenps.postgres.PostgresDBStorage._ensure_pool_open", new_callable=AsyncMock)
+    async def test_execute_success_and_error(self, mock_ensure):
+        inst = PostgresDBStorage({"min_connections":1,"max_connections":1})
+        # fake pool and cursor
+        cursor = AsyncMock()
+        conn = AsyncMock()
+        conn.cursor.return_value.__aenter__.return_value = cursor
+        inst.conn_pool = MagicMock()
+        inst.conn_pool.connection.return_value.__aenter__.return_value = conn
+
+        # success path
+        await inst._execute("some sql", {"p":1})
+        cursor.execute.assert_awaited_with("some sql", {"p":1})
+        conn.commit.assert_awaited()
+
+        # failure path
+        cursor.execute.side_effect = RuntimeError("oops")
+        with self.assertRaises(RuntimeError):
+            await inst._execute("bad sql")
+        # error should have been logged but re-raised
+
+    @patch("lib.collectors.sevenps.postgres.PostgresDBStorage._ensure_pool_open", new_callable=AsyncMock)
+    async def test_fetch_all_success_and_error(self, mock_ensure):
+        inst = PostgresDBStorage({"min_connections":1,"max_connections":1})
+        cursor = AsyncMock()
+        conn = AsyncMock()
+        inst.conn_pool = MagicMock()
+        inst.conn_pool.connection.return_value.__aenter__.return_value = conn
+        conn.cursor.return_value.__aenter__.return_value = cursor
+
+        # success
+        cursor.execute.return_value = None
+        cursor.fetchall.return_value = [(1,),(2,)]
+        result = await inst._fetch_all("select 1")
+        self.assertEqual(result, [(1,),(2,)])
+
+        # error
+        cursor.execute.side_effect = ValueError("bad")
+        with self.assertRaises(ValueError):
+            await inst._fetch_all("select bad")
+
+    @patch("time.sleep", return_value=None)
+    async def test_store_test_set_data_branches(self, _):
+        inst = PostgresDBStorage({"min_connections":1,"max_connections":1})
+        inst.conn_pool = AsyncMock()
+        inst.conn_pool.connection.return_value.__aenter__.return_value = AsyncMock(
+            cursor=AsyncMock(__aenter__=AsyncMock(return_value=AsyncMock())),
+            __aenter__=AsyncMock(return_value=AsyncMock())
+        )
+
+        # empty records → ValueError
+        with self.assertRaises(ValueError):
+            await inst.store_test_set_data([])
+
+        # UniqueViolation
+        cursor = AsyncMock()
+        cursor.execute.side_effect = errors.UniqueViolation("dup")
+        conn = AsyncMock()
+        conn.cursor.return_value.__aenter__.return_value = cursor
+        inst.conn_pool.connection.return_value.__aenter__.return_value = conn
+        with self.assertRaises(errors.UniqueViolation):
+            await inst.store_test_set_data([{"foo":"bar"}])
+
+        # generic Exception → retries then DatabaseError
+        cursor = AsyncMock()
+        cursor.execute.side_effect = RuntimeError("fail")
+        conn = AsyncMock()
+        conn.cursor.return_value.__aenter__.return_value = cursor
+        inst.conn_pool.connection.return_value.__aenter__.return_value = conn
+
+        with self.assertRaises(DatabaseError):
+            await inst.store_test_set_data([{"foo":"bar"}])
+
+    @patch("time.sleep", return_value=None)
+    async def test_get_test_set_data(self, _):
+        inst = PostgresDBStorage({"min_connections":1,"max_connections":1})
+        # happy path by artifact_id
+        cursor = AsyncMock()
+        cursor.execute.return_value = None
+        cursor.fetchall.return_value = [("r1",),("r2",)]
+        conn = AsyncMock()
+        conn.cursor.return_value.__aenter__.return_value = cursor
+        inst.conn_pool = MagicMock()
+        inst.conn_pool.connection.return_value.__aenter__.return_value = conn
+
+        res = await inst.get_test_set_data(artifact_id="A1")
+        self.assertEqual(res, ["r1","r2"])
+
+        # no rows → RecordNotFoundException
+        cursor.fetchall.return_value = []
+        with self.assertRaises(RecordNotFoundException):
+            await inst.get_test_set_data(test_request_id="T1")
+
+        # db error bubbles
+        cursor.execute.side_effect = RuntimeError("db")
+        with self.assertRaises(RuntimeError):
+            await inst.get_test_set_data(test_request_id="T1")
+
