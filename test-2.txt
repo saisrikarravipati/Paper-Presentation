@@ -1,23 +1,7 @@
-"""
-tests/test_db_final.py
-~~~~~~~~~~~~~~~~~~~~~~
-100 %-coverage unit tests for PostgresDBStorage.
-
-Key fixes vs. previous versions
--------------------------------
-* The fake async-context managers now expose **real coroutine functions**
-  (`__aenter__` / `__aexit__`) so `async with` works – this removes the
-  “AttributeError: aenter” failures.
-* `_setup_get()` returns both `storage` **and** `cursor`, preventing the
-  `UnboundLocalError`.
-* `pool.close` is an **AsyncMock**, so `await self.conn_pool.close()` inside
-  `stopped()` is legal – no more “NoneType can’t be used in 'await'”.
-"""
-
 import importlib
 import types
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 # ────────────────────── locate postgres module dynamically ───────────────────── #
 try:  # layout A: lib/collectors/sevenps/storage/postgres.py
@@ -33,10 +17,11 @@ def _make_pool(*, closed: bool = True):
     """
     Return (pool, cursor).
 
-    pool   – AsyncMock that behaves like psycopg.AsyncConnectionPool
+    pool   – MagicMock with AsyncMock methods for open/close
     cursor – AsyncMock; handy for assertions in the tests
     """
-    pool = AsyncMock()
+    # top-level pool -----------------------------------------------------------
+    pool = MagicMock()
     pool.closed = closed
     pool.open = AsyncMock()
     pool.close = AsyncMock()
@@ -47,17 +32,17 @@ def _make_pool(*, closed: bool = True):
     cursor.fetchall = AsyncMock()
 
     # connection object ----------------------------------------------------------
-    conn = AsyncMock()
+    conn = MagicMock()
     conn.commit = AsyncMock()
 
     # cursor() → async context-manager
-    cursor_cm = AsyncMock()
+    cursor_cm = MagicMock()
     cursor_cm.__aenter__ = AsyncMock(return_value=cursor)
     cursor_cm.__aexit__ = AsyncMock(return_value=False)
     conn.cursor.return_value = cursor_cm
 
     # pool.connection() → async context-manager
-    conn_cm = AsyncMock()
+    conn_cm = MagicMock()
     conn_cm.__aenter__ = AsyncMock(return_value=conn)
     conn_cm.__aexit__ = AsyncMock(return_value=False)
     pool.connection.return_value = conn_cm
