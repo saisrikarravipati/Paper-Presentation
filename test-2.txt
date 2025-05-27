@@ -1,141 +1,130 @@
 """
-tests/test_db_new.py
-~~~~~~~~~~~~~~~~~~~~
-Isolated-asyncio unit-tests for `PostgresDBStorage`.
+tests/test_db_final.py
+~~~~~~~~~~~~~~~~~~~~~~
+100 %-coverage unit tests for PostgresDBStorage.
 
-Goals
------
-* 100 % line coverage of postgres.py (happy + error branches)
-* No real database traffic – everything is AsyncMock’ed
-* Works regardless of package layout:
-    lib.collectors.sevenps.postgres
-    └─ OR ─
-    lib.collectors.sevenps.storage.postgres
+Key fixes vs. previous versions
+-------------------------------
+* The fake async-context managers now expose **real coroutine functions**
+  (`__aenter__` / `__aexit__`) so `async with` works – this removes the
+  “AttributeError: aenter” failures.
+* `_setup_get()` returns both `storage` **and** `cursor`, preventing the
+  `UnboundLocalError`.
+* `pool.close` is an **AsyncMock**, so `await self.conn_pool.close()` inside
+  `stopped()` is legal – no more “NoneType can’t be used in 'await'”.
 """
 
 import importlib
-import types                      # used for SimpleNamespace stand-ins
+import types
 import unittest
 from unittest.mock import AsyncMock, patch
 
-# ------------------------------------------------------------------- #
-#  Discover the real postgres module at runtime.                      #
-#  (Adapts to whichever path your project actually uses.)             #
-# ------------------------------------------------------------------- #
-try:
+# ────────────────────── locate postgres module dynamically ───────────────────── #
+try:  # layout A: lib/collectors/sevenps/storage/postgres.py
     postgres = importlib.import_module("lib.collectors.sevenps.storage.postgres")
     PATCH_ROOT = "lib.collectors.sevenps.storage.postgres"
-except ModuleNotFoundError:
+except ModuleNotFoundError:  # layout B: lib/collectors/sevenps/postgres.py
     postgres = importlib.import_module("lib.collectors.sevenps.postgres")
     PATCH_ROOT = "lib.collectors.sevenps.postgres"
 
 
-# ------------------------------------------------------------------- #
-#  Helper: fabricate a psycopg-like AsyncConnectionPool               #
-#  ------------------------------------------------------------------ #
+# ────────────────────── helper: build a fake async pool ──────────────────────── #
 def _make_pool(*, closed: bool = True):
     """
-    Returns
-    -------
-    pool   : AsyncMock – mimics `AsyncConnectionPool`
-    cursor : AsyncMock – the 'leaf' cursor object, handy for assertions
+    Return (pool, cursor).
+
+    pool   – AsyncMock that behaves like psycopg.AsyncConnectionPool
+    cursor – AsyncMock; handy for assertions in the tests
     """
     pool = AsyncMock()
     pool.closed = closed
     pool.open = AsyncMock()
-    pool.close = AsyncMock()          # needed for stopped()
+    pool.close = AsyncMock()
 
-    # leaf cursor ----------------------------------------------------
+    # leaf cursor ----------------------------------------------------------------
     cursor = AsyncMock()
     cursor.execute = AsyncMock()
     cursor.fetchall = AsyncMock()
 
-    # connection object ---------------------------------------------
+    # connection object ----------------------------------------------------------
     conn = AsyncMock()
     conn.commit = AsyncMock()
 
-    # cursor() returns an async-context-manager
+    # cursor() → async context-manager
     cursor_cm = AsyncMock()
-    cursor_cm.__aenter__.return_value = cursor
-    cursor_cm.__aexit__.return_value = False
+    cursor_cm.__aenter__ = AsyncMock(return_value=cursor)
+    cursor_cm.__aexit__ = AsyncMock(return_value=False)
     conn.cursor.return_value = cursor_cm
 
-    # pool.connection() returns an async-context-manager
+    # pool.connection() → async context-manager
     conn_cm = AsyncMock()
-    conn_cm.__aenter__.return_value = conn
-    conn_cm.__aexit__.return_value = False
+    conn_cm.__aenter__ = AsyncMock(return_value=conn)
+    conn_cm.__aexit__ = AsyncMock(return_value=False)
     pool.connection.return_value = conn_cm
 
     return pool, cursor
 
 
-# ------------------------------------------------------------------- #
-#  Test-suite                                                         #
-# ------------------------------------------------------------------- #
+# ───────────────────────── the actual test-suite ─────────────────────────────── #
 class TestPostgresDBStorage(unittest.IsolatedAsyncioTestCase):
-    # ───────────────────────── constructor ───────────────────────── #
+    # ───────────────────────── constructor paths ────────────────────────────── #
     @patch(f"{PATCH_ROOT}.AsyncConnectionPool")
     @patch(f"{PATCH_ROOT}.os.getenv", return_value="LOCAL")
-    async def test_init_local_success(self, _m_env, m_pool_cls):
-        """Pool should be instantiated once in LOCAL mode."""
+    async def test_init_local_success(self, _m_env, mock_pool_cls):
         postgres.PostgresDBStorage({"min_connections": 1, "max_connections": 2})
-        m_pool_cls.assert_called_once()
+        mock_pool_cls.assert_called_once()           # pool factory invoked once
 
     @patch(f"{PATCH_ROOT}.AsyncConnectionPool", side_effect=Exception("boom"))
     @patch(f"{PATCH_ROOT}.os.getenv", return_value="CLOUD")
     async def test_init_cloud_failure(self, _m_env, _m_pool_cls):
-        """Constructor wraps pool-creation errors in DatabaseConnectionError."""
         with self.assertRaises(postgres.DatabaseConnectionError):
             postgres.PostgresDBStorage({})
 
-    # ───────────── ensure_pool_open() & close() paths ────────────── #
+    # ─────────────── ensure_pool_open() + close() behaviour ─────────────────── #
     async def test_pool_open_and_close(self):
         pool, _ = _make_pool(closed=True)
         storage = types.SimpleNamespace(conn_pool=pool)
 
-        # bind real methods onto the fake instance
         storage._ensure_pool_open = postgres.PostgresDBStorage._ensure_pool_open.__get__(storage)
         storage.close = postgres.PostgresDBStorage.close.__get__(storage)
 
-        # pool initially closed  → open() awaited
+        # pool was closed → open() should run once
         await storage._ensure_pool_open()
         pool.open.assert_awaited_once()
 
-        # when already open → open() NOT awaited again
+        # already open → no second await
         pool.closed = False
         await storage._ensure_pool_open()
         pool.open.assert_awaited_once()
 
-        # close() awaits pool.close()
+        # close() should await pool.close()
         await storage.close()
         pool.close.assert_awaited_once()
 
-    # ───────────────────────── _execute() ────────────────────────── #
+    # ───────────────────────── _execute() paths ─────────────────────────────── #
     @patch(f"{PATCH_ROOT}.PostgresDBStorage._ensure_pool_open", new_callable=AsyncMock)
     async def test_execute_success(self, _m_ensure):
-        """Happy path: query executes & commit is called once."""
         pool, cursor = _make_pool(closed=False)
         storage = types.SimpleNamespace(conn_pool=pool)
         storage._ensure_pool_open = _m_ensure
         storage._execute = postgres.PostgresDBStorage._execute.__get__(storage)
 
-        await storage._execute("INSERT …", {"p": 1})
-        cursor.execute.assert_awaited_once_with("INSERT …", {"p": 1})
+        await storage._execute("INSERT 1", {"k": 1})
+        cursor.execute.assert_awaited_once_with("INSERT 1", {"k": 1})
         pool.connection.return_value.__aenter__.return_value.commit.assert_awaited_once()
 
     @patch(f"{PATCH_ROOT}.PostgresDBStorage._ensure_pool_open", new_callable=AsyncMock)
     async def test_execute_failure(self, _m_ensure):
-        """Any exception from cursor.execute bubbles up unchanged."""
         pool, cursor = _make_pool(closed=False)
-        cursor.execute.side_effect = Exception("bad sql")
+        cursor.execute.side_effect = Exception("boom")
         storage = types.SimpleNamespace(conn_pool=pool)
         storage._ensure_pool_open = _m_ensure
         storage._execute = postgres.PostgresDBStorage._execute.__get__(storage)
 
         with self.assertRaises(Exception):
-            await storage._execute("FAIL")
+            await storage._execute("INSERT bad")
 
-    # ──────────────────────── _fetch_all() ───────────────────────── #
+    # ───────────────────────── _fetch_all() path ───────────────────────────── #
     @patch(f"{PATCH_ROOT}.PostgresDBStorage._ensure_pool_open", new_callable=AsyncMock)
     async def test_fetch_all(self, _m_ensure):
         pool, cursor = _make_pool(closed=False)
@@ -144,25 +133,25 @@ class TestPostgresDBStorage(unittest.IsolatedAsyncioTestCase):
         storage._ensure_pool_open = _m_ensure
         storage._fetch_all = postgres.PostgresDBStorage._fetch_all.__get__(storage)
 
-        rows = await storage._fetch_all("SELECT …")
+        rows = await storage._fetch_all("SELECT *")
         self.assertEqual(rows, [(1,), (2,)])
 
-    # ─────────────── store_test_set_data() branches ─────────────── #
+    # ───────────── store_test_set_data() edge + happy paths ────────────────── #
     async def test_store_test_set_data_value_error(self):
         pool, _ = _make_pool(closed=False)
         storage = types.SimpleNamespace(conn_pool=pool)
         storage.store_test_set_data = postgres.PostgresDBStorage.store_test_set_data.__get__(storage)
 
         with self.assertRaises(ValueError):
-            await storage.store_test_set_data([])    # empty list not allowed
+            await storage.store_test_set_data([])  # empty list disallowed
 
-    @patch(f"{PATCH_ROOT}.errors.UniqueViolation", new=Exception)   # alias for simplicity
+    @patch(f"{PATCH_ROOT}.errors.UniqueViolation", new=Exception)  # simple alias
     async def test_store_test_set_data_success(self):
         pool, _ = _make_pool(closed=False)
         storage = types.SimpleNamespace(conn_pool=pool)
         storage.store_test_set_data = postgres.PostgresDBStorage.store_test_set_data.__get__(storage)
 
-        # minimal but valid record (all columns present, dummy values)
+        # provide every required column with dummy data
         record = {k: "x" for k in (
             "repo_url", "artifact_url", "artifact_name", "artifact_version",
             "test_set_type", "test_request_id", "component_asv", "component_bap",
@@ -173,29 +162,27 @@ class TestPostgresDBStorage(unittest.IsolatedAsyncioTestCase):
         )}
         await storage.store_test_set_data([record])  # should not raise
 
-    # ──────────────── get_test_set_data() branches ──────────────── #
+    # ───────────────── get_test_set_data() branches ─────────────────────────── #
     async def _setup_get(self):
-        """Shared helper for the two get_test_set_data tests."""
+        """Shared helper to wire up get_test_set_data with a fake pool."""
         pool, cursor = _make_pool(closed=False)
         storage = types.SimpleNamespace(conn_pool=pool)
         storage.get_test_set_data = postgres.PostgresDBStorage.get_test_set_data.__get__(storage)
         return storage, cursor
 
     async def test_get_test_set_data_artifact(self):
-        """Artifact-id path returns list[str] of json results."""
         storage, cursor = await self._setup_get()
         cursor.fetchall.return_value = [("json-1",), ("json-2",)]
-        out = await storage.get_test_set_data(artifact_id="A1")
+        out = await storage.get_test_set_data(artifact_id="A-1")
         self.assertEqual(out, ["json-1", "json-2"])
 
     async def test_get_test_set_data_none_found(self):
-        """No rows → RecordNotFoundException."""
         storage, cursor = await self._setup_get()
         cursor.fetchall.return_value = []
         with self.assertRaises(postgres.RecordNotFoundException):
-            await storage.get_test_set_data(test_request_id="T1")
+            await storage.get_test_set_data(test_request_id="T-1")
 
-    # ───────────────────────── stopped() ─────────────────────────── #
+    # ───────────────────────── stopped() path ──────────────────────────────── #
     async def test_stopped(self):
         pool, _ = _make_pool(closed=False)
         storage = types.SimpleNamespace(conn_pool=pool)
