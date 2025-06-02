@@ -1,5 +1,3 @@
-# File: lib/collectors/sevenps/storage/postgres.py
-
 from __future__ import annotations
 import os
 import threading
@@ -65,7 +63,7 @@ class PostgresDBStorage(SevenPSStorage):
         )
         self._thread.start()
 
-        # 3) Instantiate AsyncConnectionPool synchronously (so tests’ patches of run_coroutine_threadsafe don’t skip this)
+        # 3) Instantiate AsyncConnectionPool synchronously
         min_c = self.config.get("min_connections", 1)
         max_c = self.config.get("max_connections", 5)
         try:
@@ -76,7 +74,6 @@ class PostgresDBStorage(SevenPSStorage):
                 timeout=180,
             )
         except Exception as exc:
-            # Report a Schema20Event then re‐raise
             event = Schema20Event(
                 event_name="Unable to construct AsyncConnectionPool",
                 event_severity="ERROR"
@@ -89,10 +86,9 @@ class PostgresDBStorage(SevenPSStorage):
         # 4) Schedule pool.open() on the background loop
         try:
             open_future = asyncio.run_coroutine_threadsafe(self._open_pool(), self._loop)
-            open_future.result()  # if pool.open() fails, this raises
+            open_future.result()  # if pool.open() fails, this will raise
             logger.debug("Successfully opened AsyncConnectionPool")
         except Exception as exc:
-            # Report a Schema20Event and re‐raise as DatabaseConnectionError
             event = Schema20Event(
                 event_name="Unable to open AsyncConnectionPool",
                 event_severity="ERROR"
@@ -327,7 +323,12 @@ class PostgresDBStorage(SevenPSStorage):
                         "SEVENPS-COLLECTOR-ERROR: Unable to write record to db: " + str(exc)
                     ) from exc
 
-    def get_test_set_data(self, *, test_request_id: Optional[str] = None, artifact_id: Optional[str] = None) -> List[str]:
+    def get_test_set_data(
+        self,
+        *,
+        test_request_id: Optional[str] = None,
+        artifact_id: Optional[str] = None
+    ) -> List[str]:
         """
         Synchronous wrapper around get_test_set_data_async.
         """
@@ -335,7 +336,12 @@ class PostgresDBStorage(SevenPSStorage):
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return fut.result()
 
-    async def get_test_set_data_async(self, *, test_request_id: Optional[str] = None, artifact_id: Optional[str] = None) -> List[str]:
+    async def get_test_set_data_async(
+        self,
+        *,
+        test_request_id: Optional[str] = None,
+        artifact_id: Optional[str] = None
+    ) -> List[str]:
         """
         The real async coroutine: SELECT results FROM sevenps_result_set WHERE [filter].
         Returns a list of JSON strings (first column of each row).
@@ -362,3 +368,414 @@ class PostgresDBStorage(SevenPSStorage):
                 "SEVENPS-COLLECTOR-ERROR: No test results found with the provided ID"
             )
         return [r[0] for r in rows]
+
+
+---------------
+
+
+import unittest
+import asyncio
+from unittest.mock import AsyncMock, patch, MagicMock
+
+from psycopg import errors
+
+from lib.collectors.sevenps.storage.postgres import (
+    PostgresDBStorage,
+    DatabaseConnectionError,
+    DatabaseError,
+    RecordNotFoundException,
+)
+
+PATCH_ROOT = "lib.collectors.sevenps.storage.postgres"
+
+
+def _make_fake_pool(closed: bool = True):
+    """
+    Build (fake_pool, fake_cursor) such that:
+      - fake_pool.closed = closed
+      - fake_pool.open / close are AsyncMock
+      - fake_pool.connection() returns an async‐CM that yields fake_conn
+      - fake_conn.commit is AsyncMock
+      - fake_conn.cursor() returns an async‐CM that yields fake_cursor
+      - fake_cursor.execute, fake_cursor.fetchall are AsyncMock
+    """
+    fake_pool = AsyncMock()
+    fake_pool.closed = closed
+    fake_pool.open = AsyncMock()
+    fake_pool.close = AsyncMock()
+
+    fake_conn = AsyncMock()
+    fake_conn.commit = AsyncMock()
+
+    fake_cursor = AsyncMock()
+    fake_cursor.execute = AsyncMock()
+    fake_cursor.fetchall = AsyncMock()
+
+    # pool.connection() → context manager yielding fake_conn
+    conn_cm = AsyncMock()
+    conn_cm.__aenter__.return_value = fake_conn
+    conn_cm.__aexit__.return_value = False
+    fake_pool.connection.return_value = conn_cm
+
+    # conn.cursor() → context manager yielding fake_cursor
+    cur_cm = AsyncMock()
+    cur_cm.__aenter__.return_value = fake_cursor
+    cur_cm.__aexit__.return_value = False
+    fake_conn.cursor.return_value = cur_cm
+
+    return fake_pool, fake_cursor
+
+
+class TestPostgresDBStorage(unittest.TestCase):
+    # ───────────────────────── constructor paths ────────────────────────────── #
+
+    @patch(f"{PATCH_ROOT}.AsyncConnectionPool")
+    @patch(f"{PATCH_ROOT}.os.getenv", return_value="LOCAL")
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_init_local_success(self, m_run_tc, m_env, m_pool_cls):
+        """
+        If os.getenv('CLOUD') → 'LOCAL', __init__ must call AsyncConnectionPool(...) once,
+        and schedule run_coroutine_threadsafe(_open_pool) exactly once.
+        """
+        fake_pool, _ = _make_fake_pool(closed=True)
+        m_pool_cls.return_value = fake_pool
+
+        class DummyFuture:
+            def result(self):
+                return None
+
+        m_run_tc.return_value = DummyFuture()
+
+        # Construct—should not raise
+        PostgresDBStorage({"min_connections": 1, "max_connections": 2})
+
+        m_pool_cls.assert_called_once()
+        self.assertTrue(m_run_tc.called)
+
+    @patch(f"{PATCH_ROOT}.AsyncConnectionPool", side_effect=Exception("boom"))
+    @patch(f"{PATCH_ROOT}.os.getenv", return_value="CLOUD")
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_init_cloud_failure(self, m_run_tc, m_env, m_pool_cls):
+        """
+        If os.getenv('CLOUD') → 'CLOUD' and AsyncConnectionPool(...) throws,
+        then __init__ should re‐raise DatabaseConnectionError.
+        """
+        with self.assertRaises(DatabaseConnectionError):
+            PostgresDBStorage({})
+
+    # ─────────────── ensure_pool_open_async() + _close_pool behavior ─────────────────── #
+
+    def test_pool_open_and_close_coroutines(self):
+        """
+        Directly test the async coroutines:
+         - If pool.closed=True, await pool.open() once.
+         - If pool.closed=False, no second open().
+         - _close_pool() should await pool.close().
+        """
+        fake_pool, _ = _make_fake_pool(closed=True)
+        storage = PostgresDBStorage.__new__(PostgresDBStorage)
+        storage._pool = fake_pool
+
+        ensure_coro = PostgresDBStorage._ensure_pool_open_async.__get__(storage)
+        close_coro = PostgresDBStorage._close_pool.__get__(storage)
+
+        # Step 1: pool.closed=True → open() awaited once
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(ensure_coro())
+            fake_pool.open.assert_awaited_once()
+        finally:
+            loop.close()
+
+        # Step 2: pool.closed=False → open() not awaited again
+        fake_pool.closed = False
+        fake_pool.open.reset_mock()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(ensure_coro())
+            fake_pool.open.assert_not_awaited()
+        finally:
+            loop.close()
+
+        # Step 3: close pool
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(close_coro())
+            fake_pool.close.assert_awaited_once()
+        finally:
+            loop.close()
+
+    # ───────────────────────── _execute() paths ─────────────────────────────── #
+
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_execute_success(self, m_run_tc):
+        """
+        Test that _execute(...) calls cursor.execute + conn.commit() under the hood.
+        """
+        fake_pool, fake_cursor = _make_fake_pool(closed=False)
+
+        storage = PostgresDBStorage.__new__(PostgresDBStorage)
+        storage._pool = fake_pool
+        storage._loop = asyncio.new_event_loop()
+
+        class DummyFuture:
+            def __init__(self, val):
+                self._val = val
+
+            def result(self):
+                return self._val
+
+        def fake_run(coro, loop):
+            runner = asyncio.new_event_loop()
+            try:
+                res = runner.run_until_complete(coro)
+                return DummyFuture(res)
+            finally:
+                runner.close()
+
+        m_run_tc.side_effect = fake_run
+
+        storage._execute("INSERT INTO xyz(id) VALUES(%s)", {"id": 1})
+
+        # cursor.execute and commit both must have been awaited
+        fake_cursor.execute.assert_awaited_once_with("INSERT INTO xyz(id) VALUES(%s)", {"id": 1})
+        fake_pool.connection.return_value.__aenter__.return_value.commit.assert_awaited_once()
+
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_execute_failure(self, m_run_tc):
+        """
+        If cursor.execute(...) inside _execute_async throws, then _execute(...) re‐raises.
+        """
+        fake_pool, fake_cursor = _make_fake_pool(closed=False)
+        fake_cursor.execute.side_effect = Exception("boom")
+
+        storage = PostgresDBStorage.__new__(PostgresDBStorage)
+        storage._pool = fake_pool
+        storage._loop = asyncio.new_event_loop()
+
+        class DummyFuture:
+            def __init__(self, result_or_exc):
+                self._res = result_or_exc
+
+            def result(self):
+                if isinstance(self._res, Exception):
+                    raise self._res
+                return self._res
+
+        def fake_run(coro, loop):
+            runner = asyncio.new_event_loop()
+            try:
+                res = runner.run_until_complete(coro)
+                return DummyFuture(res)
+            except Exception as e:
+                return DummyFuture(e)
+            finally:
+                runner.close()
+
+        m_run_tc.side_effect = fake_run
+
+        with self.assertRaises(Exception):
+            storage._execute("INSERT BAD", None)
+
+    # ───────────────────────── fetch_all() path ─────────────────────────────── #
+
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_fetch_all(self, m_run_tc):
+        """
+        Test that fetch_all(...) returns whatever fetch_all_async returned.
+        """
+        fake_pool, fake_cursor = _make_fake_pool(closed=False)
+        fake_cursor.fetchall.return_value = [(1,), (2,)]
+
+        storage = PostgresDBStorage.__new__(PostgresDBStorage)
+        storage._pool = fake_pool
+        storage._loop = asyncio.new_event_loop()
+
+        class DummyFuture:
+            def __init__(self, val):
+                self._val = val
+
+            def result(self):
+                return self._val
+
+        def fake_run(coro, loop):
+            runner = asyncio.new_event_loop()
+            try:
+                res = runner.run_until_complete(coro)
+                return DummyFuture(res)
+            finally:
+                runner.close()
+
+        m_run_tc.side_effect = fake_run
+
+        rows = storage.fetch_all("SELECT * FROM foo", None)
+        self.assertEqual(rows, [(1,), (2,)])
+
+    # ───────────── store_test_set_data() edge + happy paths ────────────────── #
+
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_store_test_set_data_value_error(self, m_run_tc):
+        """
+        If records == [], synchronous wrapper must immediately raise ValueError.
+        """
+        fake_pool, _ = _make_fake_pool(closed=False)
+        storage = PostgresDBStorage.__new__(PostgresDBStorage)
+        storage._pool = fake_pool
+        storage._loop = asyncio.new_event_loop()
+
+        with self.assertRaises(ValueError):
+            storage.store_test_set_data([])
+
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_store_test_set_data_success(self, m_run_tc):
+        """
+        If you supply a well-formed record, no exception should be raised,
+        and cursor.execute(...) must be awaited at least once.
+        """
+        fake_pool, fake_cursor = _make_fake_pool(closed=False)
+
+        storage = PostgresDBStorage.__new__(PostgresDBStorage)
+        storage._pool = fake_pool
+        storage._loop = asyncio.new_event_loop()
+
+        class DummyFuture:
+            def __init__(self, val):
+                self._val = val
+
+            def result(self):
+                return self._val
+
+        def fake_run(coro, loop):
+            runner = asyncio.new_event_loop()
+            try:
+                res = runner.run_until_complete(coro)
+                return DummyFuture(res)
+            finally:
+                runner.close()
+
+        m_run_tc.side_effect = fake_run
+
+        record = {k: "x" for k in (
+            "repo_url", "artifact_url", "artifact_name", "artifact_version",
+            "test_set_type", "test_request_id", "component_asv", "component_bap",
+            "report_doc", "report_source", "traceability_doc",
+            "github_org", "github_repo", "github_branch",
+            "pr_url", "pr_id_branch", "pr_source_branch",
+            "build_id", "test_type_details", "test_run_status"
+        )}
+        # Should not raise
+        storage.store_test_set_data([record])
+
+        self.assertTrue(fake_cursor.execute.await_count >= 1)
+
+    # ───────────────── get_test_set_data() branches ─────────────────────────── #
+
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_get_test_set_data_artifact_success(self, m_run_tc):
+        """
+        If get_test_set_data(...) finds rows, return a list of strings.
+        """
+        fake_pool, fake_cursor = _make_fake_pool(closed=False)
+        fake_cursor.fetchall.return_value = [("json-1",), ("json-2",)]
+
+        storage = PostgresDBStorage.__new__(PostgresDBStorage)
+        storage._pool = fake_pool
+        storage._loop = asyncio.new_event_loop()
+
+        class DummyFuture:
+            def __init__(self, val):
+                self._val = val
+
+            def result(self):
+                return self._val
+
+        def fake_run(coro, loop):
+            runner = asyncio.new_event_loop()
+            try:
+                res = runner.run_until_complete(coro)
+                return DummyFuture(res)
+            finally:
+                runner.close()
+
+        m_run_tc.side_effect = fake_run
+
+        out = storage.get_test_set_data(artifact_id="A-1")
+        self.assertEqual(out, ["json-1", "json-2"])
+
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_get_test_set_data_not_found(self, m_run_tc):
+        """
+        If no rows are returned, get_test_set_data(...) should raise RecordNotFoundException.
+        """
+        fake_pool, fake_cursor = _make_fake_pool(closed=False)
+        fake_cursor.fetchall.return_value = []
+
+        storage = PostgresDBStorage.__new__(PostgresDBStorage)
+        storage._pool = fake_pool
+        storage._loop = asyncio.new_event_loop()
+
+        class DummyFuture:
+            def __init__(self, val_or_exc):
+                self._val = val_or_exc
+
+            def result(self):
+                if isinstance(self._val, Exception):
+                    raise self._val
+                return self._val
+
+        def fake_run(coro, loop):
+            runner = asyncio.new_event_loop()
+            try:
+                res = runner.run_until_complete(coro)
+                return DummyFuture(res)
+            except Exception as e:
+                return DummyFuture(e)
+            finally:
+                runner.close()
+
+        m_run_tc.side_effect = fake_run
+
+        with self.assertRaises(RecordNotFoundException):
+            storage.get_test_set_data(test_request_id="T-1")
+
+    # ───────────────────────── close() path ──────────────────────────────── #
+
+    @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
+    def test_close(self, m_run_tc):
+        """
+        After initialization, calling close() should schedule _close_pool(),
+        then stop the loop and join the thread.
+        """
+        fake_pool, _ = _make_fake_pool(closed=False)
+
+        storage = PostgresDBStorage.__new__(PostgresDBStorage)
+        storage._pool = fake_pool
+        storage._loop = asyncio.new_event_loop()
+        storage._thread = MagicMock()
+
+        class DummyFuture:
+            def __init__(self, val):
+                self._val = val
+
+            def result(self):
+                return self._val
+
+        def fake_run(coro, loop):
+            runner = asyncio.new_event_loop()
+            try:
+                res = runner.run_until_complete(coro)
+                return DummyFuture(res)
+            finally:
+                runner.close()
+
+        m_run_tc.side_effect = fake_run
+
+        storage.close()
+
+        fake_pool.close.assert_awaited_once()
+        storage._thread.join.assert_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
