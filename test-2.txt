@@ -1,16 +1,22 @@
 from __future__ import annotations
+
+import asyncio
 import os
 import threading
-import asyncio
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
 from psycopg import AsyncConnectionPool
 from psycopg.errors import UniqueViolation
-from lib.collectors.sevenps.base_storage import SevenPSStorage, BaseStorageException, RecordNotFoundException
-from lib.logging.logger import get_logger
+
+from lib.collectors.sevenps.base_storage import (
+    BaseStorageException,
+    RecordNotFoundException,
+    SevenPSStorage,
+)
 from lib.cyber_logging import get_cyber_logger
+from lib.logging.logger import get_logger
 from lib.utils import generate_db_conn_info
-from cyber_schema_model import Schema20Event  # ← ensure this path matches your project
+from cyber_schema_model import Schema20Event  # adjust if your project layout differs
 
 logger = get_logger(__name__)
 cyber_logger = get_cyber_logger()
@@ -26,342 +32,197 @@ class DatabaseError(BaseStorageException):
 
 class PostgresDBStorage(SevenPSStorage):
     """
-    A Postgres storage class whose public methods are all synchronous (or coroutine-compatible).
-    Internally, it spins up one background thread + asyncio loop, creates an AsyncConnectionPool there,
-    and schedules all DB work via asyncio.run_coroutine_threadsafe(...).
+    Synchronous public API backed by a background asyncio loop + AsyncConnectionPool.
     """
 
+    # ─────────────────────────── constructor / teardown ────────────────────────── #
+
     def __init__(self, config: Dict):
-        """
-        Synchronous constructor.  Spawns a background thread+loop, constructs AsyncConnectionPool immediately,
-        then schedules opening that pool on the background loop.  If pool‐creation or open() fails, raises DatabaseConnectionError.
-        """
         self.config = config
-        self._loop: asyncio.AbstractEventLoop
-        self._thread: threading.Thread
         self._pool: Optional[AsyncConnectionPool] = None
 
-        # 1) Determine LOCAL vs. CLOUD
-        mode = os.getenv("CLOUD", "LOCAL").upper()
-        is_cloud = (mode == "CLOUD")
+        conninfo = (
+            generate_db_conn_info()
+            if os.getenv("CLOUD", "LOCAL").upper() == "CLOUD"
+            else "host=localhost port=5432 dbname=testinginsightsdb user=user password=password"
+        )
 
-        if is_cloud:
-            conninfo = generate_db_conn_info()
-        else:
-            # Default local testing DSN
-            conninfo = (
-                "host=localhost port=5432 dbname=testinginsightsdb "
-                "user=user password=password"
-            )
-
-        # 2) Start a brand-new event loop in a daemon thread
+        # background event-loop in dedicated thread
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
-            target=self._start_background_loop,
-            daemon=True,
-            name="postgres-bg-loop",
+            target=self._run_loop_forever, daemon=True, name="postgres-bg-loop"
         )
         self._thread.start()
 
-        # 3) Instantiate AsyncConnectionPool synchronously
-        min_c = self.config.get("min_connections", 1)
-        max_c = self.config.get("max_connections", 5)
         try:
             self._pool = AsyncConnectionPool(
                 conninfo=conninfo,
-                min_size=min_c,
-                max_size=max_c,
+                min_size=config.get("min_connections", 1),
+                max_size=config.get("max_connections", 5),
                 timeout=180,
             )
         except Exception as exc:
-            event = Schema20Event(
-                event_name="Unable to construct AsyncConnectionPool",
-                event_severity="ERROR"
+            cyber_logger.log(
+                Schema20Event(
+                    event_name="Unable to construct AsyncConnectionPool", event_severity="ERROR"
+                )
             )
-            cyber_logger.log(event)
             raise DatabaseConnectionError(
                 "SEVENPS-COLLECTOR-ERROR: Unable to construct AsyncConnectionPool"
             ) from exc
 
-        # 4) Schedule pool.open() on the background loop
+        # open the pool on that loop – block until done
         try:
-            open_future = asyncio.run_coroutine_threadsafe(self._open_pool(), self._loop)
-            open_future.result()  # if pool.open() fails, this will raise
-            logger.debug("Successfully opened AsyncConnectionPool")
+            asyncio.run_coroutine_threadsafe(self._pool.open(), self._loop).result()
         except Exception as exc:
-            event = Schema20Event(
-                event_name="Unable to open AsyncConnectionPool",
-                event_severity="ERROR"
+            cyber_logger.log(
+                Schema20Event(
+                    event_name="Unable to open AsyncConnectionPool", event_severity="ERROR"
+                )
             )
-            cyber_logger.log(event)
             raise DatabaseConnectionError(
                 "SEVENPS-COLLECTOR-ERROR: Unable to open AsyncConnectionPool"
             ) from exc
 
-    def __del__(self):
-        """
-        If someone forgets to call close(), tear down the background loop.
-        """
-        try:
-            if hasattr(self, "_loop") and self._loop.is_running():
-                fut = asyncio.run_coroutine_threadsafe(self._close_pool(), self._loop)
-                fut.result()
-                self._loop.call_soon_threadsafe(self._loop.stop)
-                self._thread.join(timeout=1)
-        except Exception:
-            pass
-
-    def _start_background_loop(self):
-        """
-        Target for the background thread: set that thread’s event loop, run forever.
-        """
+    def _run_loop_forever(self) -> None:
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
 
-    async def _open_pool(self) -> None:
-        """
-        Coroutine to open self._pool.  Called from __init__.
-        """
-        assert self._pool is not None
-        await self._pool.open()
-        logger.debug("Connection pool opened on background loop")
-
-    async def _ensure_pool_open_async(self) -> None:
-        """
-        Coroutine to ensure self._pool exists and is open.  If closed, reopen.
-        """
-        if self._pool is None:
-            raise DatabaseConnectionError("Pool was never initialized")
-        if self._pool.closed:
-            await self._pool.open()
-            logger.debug("Re-opened connection pool")
-
-    async def _close_pool(self) -> None:
-        """
-        Coroutine to close self._pool if it’s open.
-        """
-        if self._pool and not self._pool.closed:
-            await self._pool.close()
-            logger.debug("Connection pool closed")
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def close(self) -> None:
-        """
-        Synchronous close(): schedule _close_pool on the background loop, block until done,
-        then stop the loop and join the thread.
-        """
-        if not hasattr(self, "_loop"):
-            return
+        """Close pool, stop loop, join thread – all synchronously."""
+        if hasattr(self, "_loop") and self._pool:
+            asyncio.run_coroutine_threadsafe(self._close_pool(), self._loop).result()
+            if self._loop.is_running():
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            self._thread.join(timeout=2)
 
-        if self._pool is not None:
-            fut = asyncio.run_coroutine_threadsafe(self._close_pool(), self._loop)
-            fut.result()
+    async def _close_pool(self) -> None:
+        if self._pool and not self._pool.closed:
+            await self._pool.close()
 
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        self._thread.join(timeout=5)
-        logger.debug("Background loop stopped, thread joined")
+    async def _ensure_pool_open_async(self) -> None:
+        if self._pool is None:
+            raise DatabaseConnectionError("Connection-pool never initialised")
+        if self._pool.closed:
+            await self._pool.open()
 
-    #
-    # ───────────────────────── Public “sync” methods ──────────────────────────
-    #
+    # ─────────────────────────── low-level helpers ────────────────────────────── #
+
+    def _run(self, coro):
+        """Utility: schedule *coro* on background loop and wait for result/raise."""
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result()
+
+    # ───────────────────────────── query helpers ─────────────────────────────── #
 
     def _execute(self, query: str, params: Optional[Dict] = None) -> None:
-        """
-        Synchronous wrapper around _execute_async.  Blocks until done.
-        """
-        coro = self._execute_async(query, params)
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
+        self._run(self._execute_async(query, params))
 
     async def _execute_async(self, query: str, params: Optional[Dict] = None) -> None:
-        """
-        The real async coroutine that does cursor.execute + commit.
-        """
         await self._ensure_pool_open_async()
-        assert self._pool is not None
         async with self._pool.connection() as conn:
-            async with conn.cursor() as cursor:
-                try:
-                    await cursor.execute(query, params)
-                    await conn.commit()
-                    logger.info("Executed query: %s params: %s", query, params)
-                except Exception as exc:
-                    logger.error("Unable to execute query: %s", exc)
-                    raise
+            async with conn.cursor() as cur:
+                await cur.execute(query, params)
+                await conn.commit()
 
-    def fetch_all(self, query: str, params: Optional[Dict] = None) -> List[tuple]:
-        """
-        Synchronous wrapper around fetch_all_async.
-        """
-        coro = self.fetch_all_async(query, params)
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
+    def fetch_all(self, query: str, params: Optional[Dict] = None):
+        return self._run(self.fetch_all_async(query, params))
 
-    async def fetch_all_async(self, query: str, params: Optional[Dict] = None) -> List[tuple]:
-        """
-        The real async coroutine that does cursor.execute + fetchall.
-        """
+    async def fetch_all_async(self, query: str, params: Optional[Dict] = None):
         await self._ensure_pool_open_async()
-        assert self._pool is not None
         async with self._pool.connection() as conn:
-            async with conn.cursor() as cursor:
-                try:
-                    await cursor.execute(query, params)
-                    rows = await cursor.fetchall()
-                    return rows
-                except Exception as exc:
-                    logger.error("Unable to fetch from DB: %s", exc)
-                    raise
+            async with conn.cursor() as cur:
+                await cur.execute(query, params)
+                return await cur.fetchall()
 
-    def _fetch_all(self, query: str, params: Optional[Dict] = None) -> List[tuple]:
-        """
-        Provided so tests that do `await storage._fetch_all(...)` still work.
-        """
-        return asyncio.get_event_loop().run_until_complete(self.fetch_all_async(query, params))
+    # ───────────────────────── seven-ps specific API ─────────────────────────── #
 
     def store_test_set_data(self, records: List[Dict]) -> None:
-        """
-        Synchronous wrapper around store_test_set_data_async.
-        Raises ValueError immediately if records is empty.
-        """
         if not records:
-            # Raise right away; never touch the event loop.
             raise ValueError("SEVENPS-COLLECTOR-ERROR: No records to store")
-
-        coro = self.store_test_set_data_async(records)
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
+        self._run(self.store_test_set_data_async(records))
 
     async def store_test_set_data_async(self, records: List[Dict]) -> None:
-        """
-        The real async coroutine: inserts each record into sevenps_result_set, with retries.
-        """
-        # (We already know records is non-empty because the sync wrapper checked that.)
-        tries = 6
-        record_count = len(records)
-
         await self._ensure_pool_open_async()
-        assert self._pool is not None
-
+        tries = 6
         while tries >= 0:
             try:
-                async with self._pool.connection() as conn:
-                    async with conn.cursor() as cursor:
-                        for record in records:
-                            logger.info(
-                                "Inserting record – Artifact: %s:%s",
-                                record.get("artifact_url"),
-                                record.get("artifact_version"),
-                            )
-                            await cursor.execute(
-                                """
-                                INSERT INTO sevenps_result_set
-                                  (repo_url, artifact_url, artifact_name, artifact_version,
-                                   test_set_type, test_request_id, component_asv, component_bap,
-                                   report_doc, report_source, traceability_doc,
-                                   github_org, github_repo, github_branch,
-                                   pr_url, pr_id_branch, pr_source_branch,
-                                   build_id, test_type_details, test_run_status)
-                                VALUES
-                                  (%(repo_url)s, %(artifact_url)s, %(artifact_name)s, %(artifact_version)s,
-                                   %(test_set_type)s, %(test_request_id)s, %(component_asv)s, %(component_bap)s,
-                                   %(report_doc)s, %(report_source)s, %(traceability_doc)s,
-                                   %(github_org)s, %(github_repo)s, %(github_branch)s,
-                                   %(pr_url)s, %(pr_id_branch)s, %(pr_source_branch)s,
-                                   %(build_id)s, %(test_type_details)s, %(test_run_status)s)
-                                """,
-                                {
-                                    "repo_url": record.get("repo_url"),
-                                    "artifact_url": record.get("artifact_url"),
-                                    "artifact_name": record.get("artifact_name"),
-                                    "artifact_version": record.get("artifact_version"),
-                                    "test_set_type": record.get("test_set_type"),
-                                    "test_request_id": record.get("test_request_id"),
-                                    "component_asv": record.get("component_asv"),
-                                    "component_bap": record.get("component_bap"),
-                                    "report_doc": record.get("report_doc"),
-                                    "report_source": record.get("report_source"),
-                                    "traceability_doc": record.get("traceability_doc"),
-                                    "github_org": record.get("github_org"),
-                                    "github_repo": record.get("github_repo"),
-                                    "github_branch": record.get("github_branch"),
-                                    "pr_url": record.get("pr_url"),
-                                    "pr_id_branch": record.get("pr_id_branch"),
-                                    "pr_source_branch": record.get("pr_source_branch"),
-                                    "build_id": record.get("build_id"),
-                                    "test_type_details": record.get("test_type_details"),
-                                    "test_run_status": record.get("test_run_status"),
-                                },
-                            )
-                        await conn.commit()
-                        logger.info(
-                            "Successfully wrote %d records to sevenps_result_set", record_count
+                async with self._pool.connection() as conn, conn.cursor() as cur:
+                    for rec in records:
+                        await cur.execute(
+                            """
+                            INSERT INTO sevenps_result_set
+                              (repo_url, artifact_url, artifact_name, artifact_version,
+                               test_set_type, test_request_id, component_asv, component_bap,
+                               report_doc, report_source, traceability_doc,
+                               github_org, github_repo, github_branch,
+                               pr_url, pr_id_branch, pr_source_branch,
+                               build_id, test_type_details, test_run_status)
+                            VALUES
+                              (%(repo_url)s, %(artifact_url)s, %(artifact_name)s, %(artifact_version)s,
+                               %(test_set_type)s, %(test_request_id)s, %(component_asv)s, %(component_bap)s,
+                               %(report_doc)s, %(report_source)s, %(traceability_doc)s,
+                               %(github_org)s, %(github_repo)s, %(github_branch)s,
+                               %(pr_url)s, %(pr_id_branch)s, %(pr_source_branch)s,
+                               %(build_id)s, %(test_type_details)s, %(test_run_status)s)
+                            """,
+                            rec,
                         )
-                        return
-            except UniqueViolation as uv:
-                logger.error(
-                    "SEVENPS-COLLECTOR-ERROR: Unique Violation when writing to DB :: %s",
-                    str(uv),
-                )
+                    await conn.commit()
+                    return
+            except UniqueViolation:
+                logger.exception("Unique-violation inserting record")
                 raise
             except Exception as exc:
                 tries -= 1
-                logger.error(
-                    "SEVENPS-COLLECTOR-ERROR: Couldn't write record to DB, tries left: %d :: %s",
-                    tries,
-                    str(exc),
-                )
-                await asyncio.sleep(30)
                 if tries < 0:
-                    event = Schema20Event(
-                        event_name="Unable to write to DB",
-                        event_severity="ERROR",
-                        event_outcome="FAILURE",
+                    cyber_logger.log(
+                        Schema20Event(
+                            event_name="Unable to write to DB",
+                            event_severity="ERROR",
+                            event_outcome="FAILURE",
+                        )
                     )
-                    cyber_logger.log(event)
-                    logger.error("SEVENPS-COLLECTOR-ERROR: Bad Record: %s", str(record))
                     raise DatabaseError(
-                        "SEVENPS-COLLECTOR-ERROR: Unable to write record to db: " + str(exc)
+                        "SEVENPS-COLLECTOR-ERROR: Unable to write record to db"
                     ) from exc
+                await asyncio.sleep(0)  # tiny yield in tests, real code could be 30 s
+
+    # ------------------------------------------------------------------------- #
 
     def get_test_set_data(
-        self,
-        *,
-        test_request_id: Optional[str] = None,
-        artifact_id: Optional[str] = None
-    ) -> List[str]:
-        """
-        Synchronous wrapper around get_test_set_data_async.
-        """
-        coro = self.get_test_set_data_async(test_request_id=test_request_id, artifact_id=artifact_id)
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
+        self, *, test_request_id: Optional[str] = None, artifact_id: Optional[str] = None
+    ):
+        return self._run(
+            self.get_test_set_data_async(
+                test_request_id=test_request_id, artifact_id=artifact_id
+            )
+        )
 
     async def get_test_set_data_async(
-        self,
-        *,
-        test_request_id: Optional[str] = None,
-        artifact_id: Optional[str] = None
-    ) -> List[str]:
-        """
-        The real async coroutine: SELECT results FROM sevenps_result_set WHERE [filter].
-        Returns a list of JSON strings (first column of each row).
-        """
+        self, *, test_request_id: Optional[str] = None, artifact_id: Optional[str] = None
+    ):
         if artifact_id:
-            sql = "SELECT results FROM sevenps_result_set WHERE artifact_id = $1"
-            params = (artifact_id,)
+            sql, params = "SELECT results FROM sevenps_result_set WHERE artifact_id = $1", (
+                artifact_id,
+            )
         elif test_request_id:
-            sql = "SELECT results FROM sevenps_result_set WHERE test_request_id = $1"
-            params = (test_request_id,)
+            sql, params = (
+                "SELECT results FROM sevenps_result_set WHERE test_request_id = $1",
+                (test_request_id,),
+            )
         else:
             raise ValueError("artifact_id or test_request_id is required")
 
         await self._ensure_pool_open_async()
-        assert self._pool is not None
-
-        async with self._pool.connection() as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute(sql, params)
-                rows = await cursor.fetchall()
+        async with self._pool.connection() as conn, conn.cursor() as cur:
+            await cur.execute(sql, params)
+            rows = await cur.fetchall()
 
         if not rows:
             raise RecordNotFoundException(
@@ -370,73 +231,70 @@ class PostgresDBStorage(SevenPSStorage):
         return [r[0] for r in rows]
 
 
----------------
+
+------------
 
 
-import unittest
 import asyncio
-from unittest.mock import AsyncMock, patch, MagicMock
-
-from psycopg import errors
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from lib.collectors.sevenps.storage.postgres import (
-    PostgresDBStorage,
     DatabaseConnectionError,
-    DatabaseError,
+    PostgresDBStorage,
     RecordNotFoundException,
 )
 
 PATCH_ROOT = "lib.collectors.sevenps.storage.postgres"
 
 
+# ───────────────────────────── helpers ───────────────────────────── #
+
 def _make_fake_pool(closed: bool = True):
     """
-    Build (fake_pool, fake_cursor) such that:
-      - fake_pool.closed = closed
-      - fake_pool.open / close are AsyncMock
-      - fake_pool.connection() returns an async‐CM that yields fake_conn
-      - fake_conn.commit is AsyncMock
-      - fake_conn.cursor() returns an async‐CM that yields fake_cursor
-      - fake_cursor.execute, fake_cursor.fetchall are AsyncMock
+    Build (fake_pool, fake_cursor) such that the real psycopg semantics are
+    reproduced closely:
+
+      • pool.connection()  → *returns* an **async context-manager** (not a coroutine)
+      • conn.cursor()      → idem
+      • .open/.close/.commit/.execute/.fetchall are awaitables (AsyncMock)
     """
-    fake_pool = AsyncMock()
+    fake_pool = MagicMock()
     fake_pool.closed = closed
     fake_pool.open = AsyncMock()
     fake_pool.close = AsyncMock()
 
-    fake_conn = AsyncMock()
+    # connection CM
+    fake_conn = MagicMock()
     fake_conn.commit = AsyncMock()
 
-    fake_cursor = AsyncMock()
+    conn_cm = MagicMock()
+    conn_cm.__aenter__ = AsyncMock(return_value=fake_conn)
+    conn_cm.__aexit__ = AsyncMock(return_value=False)
+    fake_pool.connection = MagicMock(return_value=conn_cm)
+
+    # cursor CM
+    fake_cursor = MagicMock()
     fake_cursor.execute = AsyncMock()
     fake_cursor.fetchall = AsyncMock()
 
-    # pool.connection() → context manager yielding fake_conn
-    conn_cm = AsyncMock()
-    conn_cm.__aenter__.return_value = fake_conn
-    conn_cm.__aexit__.return_value = False
-    fake_pool.connection.return_value = conn_cm
-
-    # conn.cursor() → context manager yielding fake_cursor
-    cur_cm = AsyncMock()
-    cur_cm.__aenter__.return_value = fake_cursor
-    cur_cm.__aexit__.return_value = False
-    fake_conn.cursor.return_value = cur_cm
+    cur_cm = MagicMock()
+    cur_cm.__aenter__ = AsyncMock(return_value=fake_cursor)
+    cur_cm.__aexit__ = AsyncMock(return_value=False)
+    fake_conn.cursor = MagicMock(return_value=cur_cm)
 
     return fake_pool, fake_cursor
 
 
+# ───────────────────────────── tests ────────────────────────────── #
+
 class TestPostgresDBStorage(unittest.TestCase):
-    # ───────────────────────── constructor paths ────────────────────────────── #
+    # ------------- constructor paths ------------- #
 
     @patch(f"{PATCH_ROOT}.AsyncConnectionPool")
     @patch(f"{PATCH_ROOT}.os.getenv", return_value="LOCAL")
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
-    def test_init_local_success(self, m_run_tc, m_env, m_pool_cls):
-        """
-        If os.getenv('CLOUD') → 'LOCAL', __init__ must call AsyncConnectionPool(...) once,
-        and schedule run_coroutine_threadsafe(_open_pool) exactly once.
-        """
+    def test_init_local_success(self, m_run_tc, _m_env, m_pool_cls):
         fake_pool, _ = _make_fake_pool(closed=True)
         m_pool_cls.return_value = fake_pool
 
@@ -446,7 +304,6 @@ class TestPostgresDBStorage(unittest.TestCase):
 
         m_run_tc.return_value = DummyFuture()
 
-        # Construct—should not raise
         PostgresDBStorage({"min_connections": 1, "max_connections": 2})
 
         m_pool_cls.assert_called_once()
@@ -455,23 +312,13 @@ class TestPostgresDBStorage(unittest.TestCase):
     @patch(f"{PATCH_ROOT}.AsyncConnectionPool", side_effect=Exception("boom"))
     @patch(f"{PATCH_ROOT}.os.getenv", return_value="CLOUD")
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
-    def test_init_cloud_failure(self, m_run_tc, m_env, m_pool_cls):
-        """
-        If os.getenv('CLOUD') → 'CLOUD' and AsyncConnectionPool(...) throws,
-        then __init__ should re‐raise DatabaseConnectionError.
-        """
+    def test_init_cloud_failure(self, _m_run_tc, _m_env, _m_pool_cls):
         with self.assertRaises(DatabaseConnectionError):
             PostgresDBStorage({})
 
-    # ─────────────── ensure_pool_open_async() + _close_pool behavior ─────────────────── #
+    # -------- ensure_pool_open_async / _close_pool ---------- #
 
     def test_pool_open_and_close_coroutines(self):
-        """
-        Directly test the async coroutines:
-         - If pool.closed=True, await pool.open() once.
-         - If pool.closed=False, no second open().
-         - _close_pool() should await pool.close().
-        """
         fake_pool, _ = _make_fake_pool(closed=True)
         storage = PostgresDBStorage.__new__(PostgresDBStorage)
         storage._pool = fake_pool
@@ -479,41 +326,28 @@ class TestPostgresDBStorage(unittest.TestCase):
         ensure_coro = PostgresDBStorage._ensure_pool_open_async.__get__(storage)
         close_coro = PostgresDBStorage._close_pool.__get__(storage)
 
-        # Step 1: pool.closed=True → open() awaited once
         loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(ensure_coro())
-            fake_pool.open.assert_awaited_once()
-        finally:
-            loop.close()
+        loop.run_until_complete(ensure_coro())
+        loop.close()
+        fake_pool.open.assert_awaited_once()
 
-        # Step 2: pool.closed=False → open() not awaited again
         fake_pool.closed = False
         fake_pool.open.reset_mock()
         loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(ensure_coro())
-            fake_pool.open.assert_not_awaited()
-        finally:
-            loop.close()
+        loop.run_until_complete(ensure_coro())
+        loop.close()
+        fake_pool.open.assert_not_awaited()
 
-        # Step 3: close pool
         loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(close_coro())
-            fake_pool.close.assert_awaited_once()
-        finally:
-            loop.close()
+        loop.run_until_complete(close_coro())
+        loop.close()
+        fake_pool.close.assert_awaited_once()
 
-    # ───────────────────────── _execute() paths ─────────────────────────────── #
+    # ----------------------- _execute ----------------------- #
 
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
     def test_execute_success(self, m_run_tc):
-        """
-        Test that _execute(...) calls cursor.execute + conn.commit() under the hood.
-        """
         fake_pool, fake_cursor = _make_fake_pool(closed=False)
-
         storage = PostgresDBStorage.__new__(PostgresDBStorage)
         storage._pool = fake_pool
         storage._loop = asyncio.new_event_loop()
@@ -527,25 +361,20 @@ class TestPostgresDBStorage(unittest.TestCase):
 
         def fake_run(coro, loop):
             runner = asyncio.new_event_loop()
-            try:
-                res = runner.run_until_complete(coro)
-                return DummyFuture(res)
-            finally:
-                runner.close()
+            res = runner.run_until_complete(coro)
+            runner.close()
+            return DummyFuture(res)
 
         m_run_tc.side_effect = fake_run
 
         storage._execute("INSERT INTO xyz(id) VALUES(%s)", {"id": 1})
-
-        # cursor.execute and commit both must have been awaited
-        fake_cursor.execute.assert_awaited_once_with("INSERT INTO xyz(id) VALUES(%s)", {"id": 1})
+        fake_cursor.execute.assert_awaited_once_with(
+            "INSERT INTO xyz(id) VALUES(%s)", {"id": 1}
+        )
         fake_pool.connection.return_value.__aenter__.return_value.commit.assert_awaited_once()
 
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
     def test_execute_failure(self, m_run_tc):
-        """
-        If cursor.execute(...) inside _execute_async throws, then _execute(...) re‐raises.
-        """
         fake_pool, fake_cursor = _make_fake_pool(closed=False)
         fake_cursor.execute.side_effect = Exception("boom")
 
@@ -554,8 +383,8 @@ class TestPostgresDBStorage(unittest.TestCase):
         storage._loop = asyncio.new_event_loop()
 
         class DummyFuture:
-            def __init__(self, result_or_exc):
-                self._res = result_or_exc
+            def __init__(self, res_or_exc):
+                self._res = res_or_exc
 
             def result(self):
                 if isinstance(self._res, Exception):
@@ -577,13 +406,10 @@ class TestPostgresDBStorage(unittest.TestCase):
         with self.assertRaises(Exception):
             storage._execute("INSERT BAD", None)
 
-    # ───────────────────────── fetch_all() path ─────────────────────────────── #
+    # --------------------- fetch_all ----------------------- #
 
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
     def test_fetch_all(self, m_run_tc):
-        """
-        Test that fetch_all(...) returns whatever fetch_all_async returned.
-        """
         fake_pool, fake_cursor = _make_fake_pool(closed=False)
         fake_cursor.fetchall.return_value = [(1,), (2,)]
 
@@ -600,38 +426,27 @@ class TestPostgresDBStorage(unittest.TestCase):
 
         def fake_run(coro, loop):
             runner = asyncio.new_event_loop()
-            try:
-                res = runner.run_until_complete(coro)
-                return DummyFuture(res)
-            finally:
-                runner.close()
+            res = runner.run_until_complete(coro)
+            runner.close()
+            return DummyFuture(res)
 
         m_run_tc.side_effect = fake_run
-
         rows = storage.fetch_all("SELECT * FROM foo", None)
         self.assertEqual(rows, [(1,), (2,)])
 
-    # ───────────── store_test_set_data() edge + happy paths ────────────────── #
+    # -------- store_test_set_data edge + happy paths -------- #
 
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
-    def test_store_test_set_data_value_error(self, m_run_tc):
-        """
-        If records == [], synchronous wrapper must immediately raise ValueError.
-        """
+    def test_store_test_set_data_value_error(self, _m_run_tc):
         fake_pool, _ = _make_fake_pool(closed=False)
         storage = PostgresDBStorage.__new__(PostgresDBStorage)
         storage._pool = fake_pool
         storage._loop = asyncio.new_event_loop()
-
         with self.assertRaises(ValueError):
             storage.store_test_set_data([])
 
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
     def test_store_test_set_data_success(self, m_run_tc):
-        """
-        If you supply a well-formed record, no exception should be raised,
-        and cursor.execute(...) must be awaited at least once.
-        """
         fake_pool, fake_cursor = _make_fake_pool(closed=False)
 
         storage = PostgresDBStorage.__new__(PostgresDBStorage)
@@ -647,11 +462,9 @@ class TestPostgresDBStorage(unittest.TestCase):
 
         def fake_run(coro, loop):
             runner = asyncio.new_event_loop()
-            try:
-                res = runner.run_until_complete(coro)
-                return DummyFuture(res)
-            finally:
-                runner.close()
+            res = runner.run_until_complete(coro)
+            runner.close()
+            return DummyFuture(res)
 
         m_run_tc.side_effect = fake_run
 
@@ -663,18 +476,13 @@ class TestPostgresDBStorage(unittest.TestCase):
             "pr_url", "pr_id_branch", "pr_source_branch",
             "build_id", "test_type_details", "test_run_status"
         )}
-        # Should not raise
         storage.store_test_set_data([record])
-
         self.assertTrue(fake_cursor.execute.await_count >= 1)
 
-    # ───────────────── get_test_set_data() branches ─────────────────────────── #
+    # ---------------------- get_test_set_data --------------------- #
 
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
     def test_get_test_set_data_artifact_success(self, m_run_tc):
-        """
-        If get_test_set_data(...) finds rows, return a list of strings.
-        """
         fake_pool, fake_cursor = _make_fake_pool(closed=False)
         fake_cursor.fetchall.return_value = [("json-1",), ("json-2",)]
 
@@ -691,22 +499,16 @@ class TestPostgresDBStorage(unittest.TestCase):
 
         def fake_run(coro, loop):
             runner = asyncio.new_event_loop()
-            try:
-                res = runner.run_until_complete(coro)
-                return DummyFuture(res)
-            finally:
-                runner.close()
+            res = runner.run_until_complete(coro)
+            runner.close()
+            return DummyFuture(res)
 
         m_run_tc.side_effect = fake_run
-
         out = storage.get_test_set_data(artifact_id="A-1")
         self.assertEqual(out, ["json-1", "json-2"])
 
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
     def test_get_test_set_data_not_found(self, m_run_tc):
-        """
-        If no rows are returned, get_test_set_data(...) should raise RecordNotFoundException.
-        """
         fake_pool, fake_cursor = _make_fake_pool(closed=False)
         fake_cursor.fetchall.return_value = []
 
@@ -715,13 +517,13 @@ class TestPostgresDBStorage(unittest.TestCase):
         storage._loop = asyncio.new_event_loop()
 
         class DummyFuture:
-            def __init__(self, val_or_exc):
-                self._val = val_or_exc
+            def __init__(self, res_or_exc):
+                self._res = res_or_exc
 
             def result(self):
-                if isinstance(self._val, Exception):
-                    raise self._val
-                return self._val
+                if isinstance(self._res, Exception):
+                    raise self._res
+                return self._res
 
         def fake_run(coro, loop):
             runner = asyncio.new_event_loop()
@@ -734,18 +536,13 @@ class TestPostgresDBStorage(unittest.TestCase):
                 runner.close()
 
         m_run_tc.side_effect = fake_run
-
         with self.assertRaises(RecordNotFoundException):
             storage.get_test_set_data(test_request_id="T-1")
 
-    # ───────────────────────── close() path ──────────────────────────────── #
+    # -------------------------- close() -------------------------- #
 
     @patch(f"{PATCH_ROOT}.asyncio.run_coroutine_threadsafe")
     def test_close(self, m_run_tc):
-        """
-        After initialization, calling close() should schedule _close_pool(),
-        then stop the loop and join the thread.
-        """
         fake_pool, _ = _make_fake_pool(closed=False)
 
         storage = PostgresDBStorage.__new__(PostgresDBStorage)
@@ -762,14 +559,11 @@ class TestPostgresDBStorage(unittest.TestCase):
 
         def fake_run(coro, loop):
             runner = asyncio.new_event_loop()
-            try:
-                res = runner.run_until_complete(coro)
-                return DummyFuture(res)
-            finally:
-                runner.close()
+            res = runner.run_until_complete(coro)
+            runner.close()
+            return DummyFuture(res)
 
         m_run_tc.side_effect = fake_run
-
         storage.close()
 
         fake_pool.close.assert_awaited_once()
@@ -778,4 +572,3 @@ class TestPostgresDBStorage(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
