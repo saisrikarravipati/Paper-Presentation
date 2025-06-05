@@ -1,8 +1,8 @@
 """
 tests/test_db.py
 ────────────────
-Exhaustive tests for lib.collectors.sevenps.storage.postgres
-that leave all real logging intact.  No live database is used.
+Covers every branch in lib.collectors.sevenps.storage.postgres without touching
+a real database.  Logging is ignored via MagicMock.
 """
 from __future__ import annotations
 
@@ -10,17 +10,17 @@ import importlib
 import os
 import unittest
 from contextlib import contextmanager
-from types import ModuleType
 from unittest.mock import MagicMock, patch
 
-# ───────────────────── import the storage module ─────────────────────── #
-postgres: ModuleType = importlib.import_module(
-    "lib.collectors.sevenps.storage.postgres"
-)
+# ─────────── import the storage module once ─────────── #
+postgres = importlib.import_module("lib.collectors.sevenps.storage.postgres")
 
-# ──────────────────── lightweight fake psycopg-pool ───────────────────── #
-class FakeConn(MagicMock):
-    """Mock connection whose cursor is also a context-manager."""
+# ─────────── neutralise logging (no assertions) ───────── #
+postgres.logger = MagicMock()
+postgres.cyber_logger = MagicMock()
+
+# ─────────── lightweight fake psycopg-pool ───────────── #
+class _FakeConn(MagicMock):
     def __init__(self):
         super().__init__(name="connection")
         cur = MagicMock(name="cursor")
@@ -30,22 +30,18 @@ class FakeConn(MagicMock):
         self.commit = MagicMock()
         self.rollback = MagicMock()
 
-class FakePool:
-    """Drop-in for psycopg_pool.ConnectionPool."""
+class _FakePool:
     def __init__(self, conninfo: str, **_):
-        self.conninfo = conninfo          # constructor logs this
-        self.conn = FakeConn()
+        self.conninfo = conninfo
+        self.conn = _FakeConn()
         self.put_calls = 0
         self.closed = False
 
-    # Legacy API used by store_test_set_data_async
-    def getconn(self):
-        return self.conn
+    # legacy API
+    def getconn(self): return self.conn
+    def putconn(self, _): self.put_calls += 1
 
-    def putconn(self, _):
-        self.put_calls += 1
-
-    # Context-manager API used by get_test_set_data
+    # context-manager API
     @contextmanager
     def connection(self):
         try:
@@ -53,24 +49,24 @@ class FakePool:
         finally:
             self.putconn(self.conn)
 
-    # Graceful-shutdown helpers
+    # graceful shutdown helpers
     def close(self): self.closed = True
     def join(self):  ...
 
-# Ensure postgres.psycopg.UniqueViolation exists even if psycopg is absent
+# Guarantee `UniqueViolation` exists even if psycopg isn't installed
 if not hasattr(postgres.psycopg, "UniqueViolation"):
     class _FakeUV(Exception): ...
     postgres.psycopg.UniqueViolation = _FakeUV
 
 
-# ───────────────────────────── TESTS ──────────────────────────────────── #
+# ─────────────────────────── TESTS ─────────────────────────── #
 class TestPostgresDBStorage(unittest.TestCase):
     def setUp(self):
-        # Replace the pool class _inside the already-imported module_
-        self.pool_patch = patch.object(postgres, "ConnectionPool", FakePool)
+        # Patch the pool class *inside* the already-imported module
+        self.pool_patch = patch.object(postgres, "ConnectionPool", _FakePool)
         self.pool_patch.start()
 
-        # Force LOCAL branch in _get_conn_info
+        # Force local branch for _get_conn_info
         with patch.dict(os.environ, {"CLOUD": "false"}):
             self.storage = postgres.PostgresDBStorage({"min_connections": 1})
 
@@ -81,7 +77,7 @@ class TestPostgresDBStorage(unittest.TestCase):
     def tearDown(self):
         self.pool_patch.stop()
 
-    # ──────────── store_test_set_data_async paths ────────────────────── #
+    # ------------- store_test_set_data_async paths ------------- #
     @patch("time.sleep", return_value=None)
     def test_store_success(self, _):
         record = {k: "1" for k in (
@@ -112,15 +108,14 @@ class TestPostgresDBStorage(unittest.TestCase):
         with self.assertRaises(postgres.DatabaseError):
             self.storage.store_test_set_data_async([{"artifact_url": "x"}])
 
-        # 6→0 retries  ⇒ 7 rollbacks / returns
-        self.assertEqual(self.conn.rollback.call_count, 7)
+        self.assertEqual(self.conn.rollback.call_count, 7)  # 6→0
         self.assertEqual(self.pool.put_calls, 7)
 
     def test_store_empty_input(self):
         with self.assertRaises(ValueError):
             self.storage.store_test_set_data_async([])
 
-    # ──────────── get_test_set_data paths ────────────────────────────── #
+    # ------------- get_test_set_data paths --------------------- #
     def test_get_data_found(self):
         self.cur.fetchall.return_value = [("json-value",)]
         self.assertEqual(
@@ -137,26 +132,24 @@ class TestPostgresDBStorage(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.storage.get_test_set_data()
 
-    # ──────────── _get_conn_info cloud branch ────────────────────────── #
+    # ------------- _get_conn_info cloud branch --------------- #
     def test_get_conn_info_cloud(self):
-        env = {"CLOUD": "true", "DB_APP_USERNAME": "u", "DB_APP_PASSWORD": "p",
-               "DB_HOST": "h", "DATABASE": "d"}
+        env = {
+            "CLOUD": "true", "DB_APP_USERNAME": "u", "DB_APP_PASSWORD": "p",
+            "DB_HOST": "h", "DATABASE": "d"
+        }
         with patch.dict(os.environ, env):
             info = postgres.PostgresDBStorage({"min_connections": 1})._get_conn_info()
         self.assertIn("host=h", info)
 
-    # ──────────── constructor failure branch ─────────────────────────── #
+    # ------------- constructor failure branch ---------------- #
     def test_init_failure(self):
         with patch.object(postgres, "ConnectionPool", side_effect=Exception):
             with self.assertRaises(postgres.DatabaseConnectionError):
                 postgres.PostgresDBStorage({})
 
-    # ──────────── graceful shutdown / stopped() ──────────────────────── #
+    # ------------- graceful shutdown ------------------------- #
     def test_close_and_stopped(self):
         self.storage.close()
         self.assertTrue(self.pool.closed)
-        self.storage.stopped()   # second close is a harmless no-op
-
-
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main(verbosity=2)
+        self.storage.stopped()   # second call is harmless
