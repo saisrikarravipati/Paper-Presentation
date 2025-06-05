@@ -1,17 +1,11 @@
 """
-test_db.py
-~~~~~~~~~~
+tests/test_db.py
+~~~~~~~~~~~~~~~~
 Unit-tests for lib.collectors.sevenps.storage.postgres.PostgresDBStorage
-with 90 %+ line-coverage and **no live database**.
+with 90 %+ coverage and **no live database**.
 
-• ConnectionPool, connections, cursors, time.sleep and psycopg.UniqueViolation
-  are fully mocked.
-• Test cases cover:
-    – ctor success / failure
-    – close()
-    – store_test_set_data : success, empty-list error, unique-violation retry path
-    – get_test_set_data   : success via artifact_id, not-found error branch
-Run:  python -m unittest -v test_db.py
+Run from repo root:
+    PYTHONPATH=. python -m unittest -v tests/test_db.py
 """
 
 import importlib
@@ -19,25 +13,36 @@ import os
 import sys
 import unittest
 from pathlib import Path
-from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 # --------------------------------------------------------------------------- #
-#               Ensure project root is on sys.path for import                 #
+#  Make sure the repo root is on sys.path so "lib.collectors..." imports work #
 # --------------------------------------------------------------------------- #
-# This makes "lib.collectors.sevenps.storage.postgres" importable even when
-# tests are run from the repo root with `python -m unittest`.
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # adjust ".." if needed
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # adjust depth if needed
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# --------------------------------------------------------------------------- #
+#  psycopg UniqueViolation – import from psycopg.errors and register globally #
+# --------------------------------------------------------------------------- #
+import psycopg
+from psycopg.errors import UniqueViolation  # real class
+
+# The production module uses psycopg.UniqueViolation, which doesn't exist
+# in psycopg-3 by default.  Adding it once here avoids patching later.
+setattr(psycopg, "UniqueViolation", UniqueViolation)
+
+# --------------------------------------------------------------------------- #
+#  Import the module under test *after* we added the attribute above.         #
+# --------------------------------------------------------------------------- #
 PG_MOD_PATH = "lib.collectors.sevenps.storage.postgres"
-postgres: ModuleType = importlib.import_module(PG_MOD_PATH)  # import once
+postgres = importlib.import_module(PG_MOD_PATH)
 
 
 # --------------------------------------------------------------------------- #
-#                         Helper-mock factories                               #
+#                   helper factories for cursor / connection                  #
 # --------------------------------------------------------------------------- #
 def _make_cursor(fetch=None, execute_side_effect=None) -> MagicMock:
+    """Return a MagicMock that behaves like a DB cursor."""
     cur = MagicMock(name="cursor")
     cur.__enter__.return_value = cur
     cur.__exit__.return_value = False
@@ -47,6 +52,7 @@ def _make_cursor(fetch=None, execute_side_effect=None) -> MagicMock:
 
 
 def _make_connection(cursor: MagicMock) -> MagicMock:
+    """Return a MagicMock that behaves like a DB connection."""
     conn = MagicMock(name="connection")
     conn.__enter__.return_value = conn
     conn.__exit__.return_value = False
@@ -55,29 +61,42 @@ def _make_connection(cursor: MagicMock) -> MagicMock:
 
 
 # --------------------------------------------------------------------------- #
-#                                  Tests                                      #
+#                                test cases                                   #
 # --------------------------------------------------------------------------- #
 class TestPostgresDBStorage(unittest.TestCase):
+    """High-coverage tests for PostgresDBStorage using only mocks."""
+
     SAMPLE_RECORD = {
-        "repo_url": "r", "artifact_url": "u", "artifact_name": "n",
-        "artifact_version": "1.0", "test_set_type": "unit",
-        "test_request_id": "REQ1", "component_asv": "asv",
-        "component_bap": "bap", "report_doc": "rdoc",
-        "report_source": "rsource", "traceability_doc": "tdoc",
-        "github_org": "org", "github_repo": "repo", "github_branch": "main",
-        "pr_url": "purl", "pr_id_branch": "pid", "pr_source_branch": "psb",
-        "build_id": "bid", "test_type_details": "details",
+        "repo_url": "r",
+        "artifact_url": "u",
+        "artifact_name": "n",
+        "artifact_version": "1.0",
+        "test_set_type": "unit",
+        "test_request_id": "REQ1",
+        "component_asv": "asv",
+        "component_bap": "bap",
+        "report_doc": "rdoc",
+        "report_source": "rsource",
+        "traceability_doc": "tdoc",
+        "github_org": "org",
+        "github_repo": "repo",
+        "github_branch": "main",
+        "pr_url": "purl",
+        "pr_id_branch": "pid",
+        "pr_source_branch": "psb",
+        "build_id": "bid",
+        "test_type_details": "details",
         "test_run_status": "PASS",
     }
 
-    # -------------- common set-up / tear-down -------------------------------- #
+    # ---------------------------- set-up / tear-down ------------------------ #
     def setUp(self):
-        # Patch ConnectionPool class *inside* the postgres module
+        # Patch ConnectionPool in the module under test
         self.pool_patcher = patch(f"{PG_MOD_PATH}.ConnectionPool")
         self.mock_pool_cls = self.pool_patcher.start()
         self.mock_pool = self.mock_pool_cls.return_value
 
-        # Patch helper/utility bits
+        # Patch helper functions / slow calls
         self.conninfo_patcher = patch.object(
             postgres.PostgresDBStorage, "_get_conn_info", return_value="dsn"
         )
@@ -86,42 +105,35 @@ class TestPostgresDBStorage(unittest.TestCase):
         self.sleep_patcher = patch(f"{PG_MOD_PATH}.time.sleep", return_value=None)
         self.sleep_patcher.start()
 
-        # Provide a fake UniqueViolation exception on postgres.psycopg
-        FakeUV = type("FakeUniqueViolation", (Exception,), {})
-        self.unique_patch = patch.object(postgres.psycopg, "UniqueViolation", FakeUV)
-        self.unique_patch.start()
-        self.UniqueViolation = FakeUV
-
         # Default connection / cursor mocks
         self.cursor = _make_cursor(fetch=[[{"answer": 42}]])
         self.connection = _make_connection(self.cursor)
         self.mock_pool.getconn.return_value = self.connection
         self.mock_pool.connection.return_value = self.connection
 
-        # Minimal env so _get_conn_info could work un-mocked if needed
+        # Minimal env if production code ever calls the real _get_conn_info
         os.environ.update(
-            dict(
-                CLOUD="false",
-                DB_APP_USERNAME="user",
-                DB_APP_PASSWORD="pw",
-                DB_HOST="host",
-                DATABASE="db",
-            )
+            {
+                "CLOUD": "false",
+                "DB_APP_USERNAME": "user",
+                "DB_APP_PASSWORD": "pw",
+                "DB_HOST": "host",
+                "DATABASE": "db",
+            }
         )
 
     def tearDown(self):
         self.pool_patcher.stop()
         self.conninfo_patcher.stop()
         self.sleep_patcher.stop()
-        self.unique_patch.stop()
 
-    # ------------------------------ ctor / close ----------------------------- #
+    # ------------------------------ ctor / close ---------------------------- #
     def test_init_success(self):
         storage = postgres.PostgresDBStorage({})
         self.assertIs(storage.conn_pool, self.mock_pool)
 
     def test_init_failure(self):
-        self.pool_patcher.stop()  # remove existing patch
+        self.pool_patcher.stop()  # remove current patch
         with patch(f"{PG_MOD_PATH}.ConnectionPool", side_effect=Exception("boom")):
             with self.assertRaises(postgres.DatabaseConnectionError):
                 postgres.PostgresDBStorage({})
@@ -132,11 +144,11 @@ class TestPostgresDBStorage(unittest.TestCase):
         self.mock_pool.close.assert_called_once()
         self.mock_pool.join.assert_called_once()
 
-    # ------------------------- store_test_set_data --------------------------- #
+    # ------------------------- store_test_set_data -------------------------- #
     def test_store_success(self):
         storage = postgres.PostgresDBStorage({})
         storage.store_test_set_data([self.SAMPLE_RECORD])
-        self.cursor.execute.assert_called()              # executed at least once
+        self.cursor.execute.assert_called()          # at least one call
         self.connection.commit.assert_called_once()
 
     def test_store_empty_raises(self):
@@ -145,14 +157,15 @@ class TestPostgresDBStorage(unittest.TestCase):
             storage.store_test_set_data([])
 
     def test_store_unique_violation(self):
-        bad_cursor = _make_cursor(execute_side_effect=self.UniqueViolation("dup"))
+        # Cursor will raise real psycopg.errors.UniqueViolation
+        bad_cursor = _make_cursor(execute_side_effect=UniqueViolation("dup key"))
         bad_conn = _make_connection(bad_cursor)
         self.mock_pool.getconn.return_value = bad_conn
         storage = postgres.PostgresDBStorage({})
-        with self.assertRaises(self.UniqueViolation):
+        with self.assertRaises(UniqueViolation):
             storage.store_test_set_data([self.SAMPLE_RECORD])
 
-    # -------------------------- get_test_set_data ---------------------------- #
+    # -------------------------- get_test_set_data --------------------------- #
     def test_get_by_artifact(self):
         storage = postgres.PostgresDBStorage({})
         result = storage.get_test_set_data(artifact_id="A-1")
