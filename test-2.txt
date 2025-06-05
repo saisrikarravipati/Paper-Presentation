@@ -1,184 +1,42 @@
-"""
-tests/test_db.py
-~~~~~~~~~~~~~~~~
-Unit-tests for lib.collectors.sevenps.storage.postgres.PostgresDBStorage
-with 90 %+ coverage and **no live database**.
-
-Run from repo root:
-    PYTHONPATH=. python -m unittest -v tests/test_db.py
-"""
-
-import importlib
-import os
-import sys
-import unittest
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+# ➊ Add these imports with the rest
+from unittest.mock import call
 
 # --------------------------------------------------------------------------- #
-#  Make sure the repo root is on sys.path so "lib.collectors..." imports work #
+# ➋ NEW tests – append to the end of TestPostgresDBStorage                     #
 # --------------------------------------------------------------------------- #
-PROJECT_ROOT = Path(__file__).resolve().parents[2]  # adjust depth if needed
-sys.path.insert(0, str(PROJECT_ROOT))
+    def test_store_retry_then_success(self):
+        """First execute() raises generic Error, second succeeds – ensures retry path."""
+        # cursor raises once, then works
+        first = MagicMock(side_effect=Exception("temp"))
+        second = MagicMock()
+        retry_cursor = _make_cursor()
+        retry_cursor.execute.side_effect = [Exception("temp"), None]
+        retry_conn = _make_connection(retry_cursor)
+        self.mock_pool.getconn.return_value = retry_conn
 
-# --------------------------------------------------------------------------- #
-#  psycopg UniqueViolation – import from psycopg.errors and register globally #
-# --------------------------------------------------------------------------- #
-import psycopg
-from psycopg.errors import UniqueViolation  # real class
-
-# The production module uses psycopg.UniqueViolation, which doesn't exist
-# in psycopg-3 by default.  Adding it once here avoids patching later.
-setattr(psycopg, "UniqueViolation", UniqueViolation)
-
-# --------------------------------------------------------------------------- #
-#  Import the module under test *after* we added the attribute above.         #
-# --------------------------------------------------------------------------- #
-PG_MOD_PATH = "lib.collectors.sevenps.storage.postgres"
-postgres = importlib.import_module(PG_MOD_PATH)
-
-
-# --------------------------------------------------------------------------- #
-#                   helper factories for cursor / connection                  #
-# --------------------------------------------------------------------------- #
-def _make_cursor(fetch=None, execute_side_effect=None) -> MagicMock:
-    """Return a MagicMock that behaves like a DB cursor."""
-    cur = MagicMock(name="cursor")
-    cur.__enter__.return_value = cur
-    cur.__exit__.return_value = False
-    cur.fetchall.return_value = fetch
-    cur.execute.side_effect = execute_side_effect
-    return cur
-
-
-def _make_connection(cursor: MagicMock) -> MagicMock:
-    """Return a MagicMock that behaves like a DB connection."""
-    conn = MagicMock(name="connection")
-    conn.__enter__.return_value = conn
-    conn.__exit__.return_value = False
-    conn.cursor.return_value = cursor
-    return conn
-
-
-# --------------------------------------------------------------------------- #
-#                                test cases                                   #
-# --------------------------------------------------------------------------- #
-class TestPostgresDBStorage(unittest.TestCase):
-    """High-coverage tests for PostgresDBStorage using only mocks."""
-
-    SAMPLE_RECORD = {
-        "repo_url": "r",
-        "artifact_url": "u",
-        "artifact_name": "n",
-        "artifact_version": "1.0",
-        "test_set_type": "unit",
-        "test_request_id": "REQ1",
-        "component_asv": "asv",
-        "component_bap": "bap",
-        "report_doc": "rdoc",
-        "report_source": "rsource",
-        "traceability_doc": "tdoc",
-        "github_org": "org",
-        "github_repo": "repo",
-        "github_branch": "main",
-        "pr_url": "purl",
-        "pr_id_branch": "pid",
-        "pr_source_branch": "psb",
-        "build_id": "bid",
-        "test_type_details": "details",
-        "test_run_status": "PASS",
-    }
-
-    # ---------------------------- set-up / tear-down ------------------------ #
-    def setUp(self):
-        # Patch ConnectionPool in the module under test
-        self.pool_patcher = patch(f"{PG_MOD_PATH}.ConnectionPool")
-        self.mock_pool_cls = self.pool_patcher.start()
-        self.mock_pool = self.mock_pool_cls.return_value
-
-        # Patch helper functions / slow calls
-        self.conninfo_patcher = patch.object(
-            postgres.PostgresDBStorage, "_get_conn_info", return_value="dsn"
-        )
-        self.conninfo_patcher.start()
-
-        self.sleep_patcher = patch(f"{PG_MOD_PATH}.time.sleep", return_value=None)
-        self.sleep_patcher.start()
-
-        # Default connection / cursor mocks
-        self.cursor = _make_cursor(fetch=[[{"answer": 42}]])
-        self.connection = _make_connection(self.cursor)
-        self.mock_pool.getconn.return_value = self.connection
-        self.mock_pool.connection.return_value = self.connection
-
-        # Minimal env if production code ever calls the real _get_conn_info
-        os.environ.update(
-            {
-                "CLOUD": "false",
-                "DB_APP_USERNAME": "user",
-                "DB_APP_PASSWORD": "pw",
-                "DB_HOST": "host",
-                "DATABASE": "db",
-            }
-        )
-
-    def tearDown(self):
-        self.pool_patcher.stop()
-        self.conninfo_patcher.stop()
-        self.sleep_patcher.stop()
-
-    # ------------------------------ ctor / close ---------------------------- #
-    def test_init_success(self):
-        storage = postgres.PostgresDBStorage({})
-        self.assertIs(storage.conn_pool, self.mock_pool)
-
-    def test_init_failure(self):
-        self.pool_patcher.stop()  # remove current patch
-        with patch(f"{PG_MOD_PATH}.ConnectionPool", side_effect=Exception("boom")):
-            with self.assertRaises(postgres.DatabaseConnectionError):
-                postgres.PostgresDBStorage({})
-
-    def test_close_calls_pool(self):
-        storage = postgres.PostgresDBStorage({})
-        storage.close()
-        self.mock_pool.close.assert_called_once()
-        self.mock_pool.join.assert_called_once()
-
-    # ------------------------- store_test_set_data -------------------------- #
-    def test_store_success(self):
         storage = postgres.PostgresDBStorage({})
         storage.store_test_set_data([self.SAMPLE_RECORD])
-        self.cursor.execute.assert_called()          # at least one call
-        self.connection.commit.assert_called_once()
 
-    def test_store_empty_raises(self):
+        # execute was tried twice, commit once
+        self.assertEqual(retry_cursor.execute.call_count, 2)
+        retry_conn.commit.assert_called_once()
+
+    def test_get_conn_info_cloud(self):
+        """_get_conn_info’s CLOUD branch creates a DSN containing env variables."""
+        with patch.dict(os.environ, CLOUD="true", DB_APP_USERNAME="u",
+                        DB_APP_PASSWORD="p", DB_HOST="h", DATABASE="d"):
+            # ConnectionPool is already patched – just create the object
+            storage = postgres.PostgresDBStorage({})
+            dsn = storage._get_conn_info()
+            self.assertIn("user=u", dsn)
+            self.assertIn("password=p", dsn)
+            self.assertIn("host=h", dsn)
+            self.assertIn("dbname=d", dsn)
+
+    def test_close_handles_exception(self):
+        """close() logs but continues when pool.close throws."""
+        self.mock_pool.close.side_effect = Exception("socket error")
         storage = postgres.PostgresDBStorage({})
-        with self.assertRaises(ValueError):
-            storage.store_test_set_data([])
-
-    def test_store_unique_violation(self):
-        # Cursor will raise real psycopg.errors.UniqueViolation
-        bad_cursor = _make_cursor(execute_side_effect=UniqueViolation("dup key"))
-        bad_conn = _make_connection(bad_cursor)
-        self.mock_pool.getconn.return_value = bad_conn
-        storage = postgres.PostgresDBStorage({})
-        with self.assertRaises(UniqueViolation):
-            storage.store_test_set_data([self.SAMPLE_RECORD])
-
-    # -------------------------- get_test_set_data --------------------------- #
-    def test_get_by_artifact(self):
-        storage = postgres.PostgresDBStorage({})
-        result = storage.get_test_set_data(artifact_id="A-1")
-        self.assertEqual(result, [{"answer": 42}])
-        self.cursor.execute.assert_called_once()
-
-    def test_get_not_found(self):
-        empty_cursor = _make_cursor(fetch=[])
-        self.mock_pool.connection.return_value = _make_connection(empty_cursor)
-        storage = postgres.PostgresDBStorage({})
-        with self.assertRaises(postgres.RecordNotFoundException):
-            storage.get_test_set_data(test_request_id="REQ-X")
-
-
-if __name__ == "__main__":  # pragma: no cover
-    unittest.main(verbosity=2)
+        # Should not raise
+        storage.close()
+        self.mock_pool.join.assert_called_once()
